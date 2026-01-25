@@ -1,0 +1,70 @@
+/* container row */
+.tis-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+/* button baseline */
+.tis-btn {
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(35,35,35,0.85);
+  color: #e9e9e9;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tis-btn:hover {
+  background: rgba(55,55,55,0.9);
+}
+
+.tis-btn:active {
+  transform: translateY(1px);
+}
+
+.tis-btn-primary {
+  border-color: rgba(255,255,255,0.25);
+}
+
+.tis-btn-reset {
+  opacity: 0.9;
+}
+
+/* inputs */
+.tis-input {
+  width: 92px;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(20,20,20,0.8);
+  color: #e9e9e9;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  outline: none;
+}
+
+.tis-input::placeholder {
+  color: rgba(233,233,233,0.55);
+}
+
+/* little status text */
+.tis-status {
+  font-size: 12px;
+  color: rgba(233,233,233,0.7);
+  margin-left: 6px;
+}
+/* pager label we inject (since roblox’s one won’t update when we override paging) */
+.tis-pager-label {
+  display: inline-block;
+  margin: 0 10px;
+  font-size: 16px;
+  color: #f7f7f8;
+  user-select: none;
+  font-family: Builder Sans, Helvetica Neue, Helvetica, Arial, Lucida Grande, sans-serif;
+  font-weight: 400;
+}

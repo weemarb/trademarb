@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "trade inventory sorter (tis)",
+  "version": "1.0.0",
+  "description": "sort + filter your tradable inventory on roblox trade pages",
+  "permissions": ["storage", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
+  "host_permissions": [
+    "https://www.roblox.com/*",
+    "https://trades.roblox.com/*",
+    "https://www.rolimons.com/*",
+    "https://api.rolimons.com/*"
+  ],
+  "background": {
+  "service_worker": "background.js",
+  "type": "module"
+  },
+  "web_accessible_resources": [
+  {
+    "resources": [
+      "injected.js",
+      "icons/rolimons.svg",
+      "icons/projected.png"
+    ],
+    "matches": ["https://www.roblox.com/*"]
+  }],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.roblox.com/users/*/trade*",
+        "https://www.roblox.com/trades/*/counter*"
+      ],
+      "js": ["content.js", "rolimons.js"],
+      "css": ["content.css"],
+      "run_at": "document_start"
+    }
+  ]
+}
