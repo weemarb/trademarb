@@ -60,30 +60,6 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
     console.warn("[tis] angular not available");
     return false;
   }
-window.addEventListener("message", (ev) => {
-  const msg = ev?.data;
-  if (msg?.type === "TIS_ROLI_ITEMDETAILS") {
-    cache.roli = msg.data || null;
-    // optional: re-apply once roli arrives
-    const panel = getYourInventoryPanel?.();
-    if (panel && cache.all) applyToAngular(panel);
-  }
-});
-
-function roliValueForInst(inst) {
-  const tid = inst?.itemTarget?.targetId;
-  if (!cache.roli || !tid) return null;
-
-  const info = cache.roli[String(tid)];
-  const v = Number(info?.value);
-  return Number.isFinite(v) && v > 0 ? v : null;
-}
-
-function effectiveValueForInst(inst) {
-  const rap = Number(inst?.recentAveragePrice ?? 0) || 0;
-  const v = roliValueForInst(inst);
-  return (v !== null && v > rap) ? v : rap;
-}
 
   const el =
     clickedEl ||
@@ -318,7 +294,14 @@ function effectiveValueForInst(inst) {
   window.postMessage({ type: "TIS_OFFER_TOTAL_VALUE", total }, "*");
 }
 
-  function computeList() {
+
+function effectiveValueForInst(inst) {
+  const rap = Number(inst?.recentAveragePrice ?? 0) || 0;
+  const v = roliValueForInst(inst);
+  return (v !== null && v > rap) ? v : rap;
+}
+
+function computeList() {
   const base = cache.groups ? cache.groups.slice() : [];
   let out = base;
 

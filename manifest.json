@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "trade inventory sorter (tis)",
+  "name": "trademarb",
   "version": "1.0.0",
   "description": "sort + filter your tradable inventory on roblox trade pages",
   "permissions": ["storage", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
