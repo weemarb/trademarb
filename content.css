@@ -52,6 +52,87 @@
   color: rgba(233,233,233,0.55);
 }
 
+.tis-search-input {
+  width: 150px;
+}
+
+.item-card-name.tis-wishlist-match-name {
+  color: inherit !important;
+  text-shadow: none !important;
+}
+
+/* only the actual text gets the animated background */
+.item-card-name.tis-wishlist-match-name .tis-wishlist-text {
+  display: inline;
+  width: auto;
+  position: relative;
+
+  font-weight: 700;
+  color: transparent !important;
+  -webkit-text-fill-color: transparent;
+
+  background-image:
+    radial-gradient(circle, rgba(255,255,255,1) 0 1px, transparent 1.8px),
+    radial-gradient(circle, rgba(255,230,95,0.95) 0 1px, transparent 2px),
+    linear-gradient(
+      105deg,
+      #ffd95a 0%,
+      #fff6ba 28%,
+      #f5c542 45%,
+      #fff2a6 60%,
+      #ffd95a 100%
+    );
+
+  background-size:
+    13px 13px,
+    19px 17px,
+    220% 100%;
+
+  background-position:
+    0 0,
+    8px 4px,
+    0 0;
+
+  -webkit-background-clip: text;
+  background-clip: text;
+
+  text-shadow:
+    0 0 4px rgba(255,246,186,0.55),
+    0 0 9px rgba(245,197,66,0.35),
+    0 1px 1px rgba(0,0,0,0.75);
+
+  animation: tis-wishlist-text-sparkle 1.35s linear infinite;
+}
+
+/* kill the old overlay layers completely */
+.item-card-name.tis-wishlist-match-name .tis-wishlist-text::before,
+.item-card-name.tis-wishlist-match-name .tis-wishlist-text::after {
+  content: none !important;
+}
+
+@keyframes tis-wishlist-text-sparkle {
+  0% {
+    background-position:
+      0 0,
+      8px 4px,
+      0% 0;
+  }
+
+  50% {
+    background-position:
+      7px -4px,
+      0 9px,
+      100% 0;
+  }
+
+  100% {
+    background-position:
+      14px -8px,
+      -8px 4px,
+      220% 0;
+  }
+}
+
 /* little status text */
 .tis-status {
   font-size: 12px;

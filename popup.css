@@ -1,0 +1,134 @@
+:root {
+  color-scheme: dark;
+  --bg: #111318;
+  --panel: #1c2028;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --text: #f2f4f8;
+  --muted: #b9c0cf;
+  --track: #343b49;
+  --track-active: #4cc970;
+  --thumb: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 260px;
+  background: var(--bg);
+  color: var(--text);
+  font: 500 14px/1.35 "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.popup-shell {
+  padding: 12px;
+}
+
+.setting-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.01));
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
+  overflow: hidden;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 16px 8px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.setting-row + .setting-row {
+  border-top: 1px solid var(--panel-border);
+}
+
+.setting-meta {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  gap: 10px;
+  min-width: 0;
+}
+
+.setting-icon {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  opacity: 0.98;
+  object-fit: contain;
+  object-position: center;
+  background: transparent;
+  mix-blend-mode: screen;
+  filter: contrast(1.15) brightness(1.12);
+}
+
+.setting-icon--skull {
+  transform: translateX(-5px) scale(1.15);
+}
+
+.setting-icon--bag {
+  object-position: left center;
+  transform: translateX(-5px) scale(1.18);
+}
+
+.setting-label {
+  flex: 1 1 auto;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.18;
+  letter-spacing: 0.01em;
+}
+
+.toggle-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.toggle-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.toggle-ui {
+  display: inline-flex;
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--track);
+  position: relative;
+  transition: background-color 0.18s ease;
+}
+
+.toggle-ui::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--thumb);
+  transition: transform 0.18s ease;
+}
+
+.toggle-input:checked + .toggle-ui {
+  background: var(--track-active);
+}
+
+.toggle-input:checked + .toggle-ui::after {
+  transform: translateX(20px);
+}
+
+.toggle-input:focus-visible + .toggle-ui {
+  outline: 2px solid rgba(255, 255, 255, 0.5);
+  outline-offset: 2px;
+}

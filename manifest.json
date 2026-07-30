@@ -7,6 +7,7 @@
   "host_permissions": [
     "https://www.roblox.com/*",
     "https://trades.roblox.com/*",
+    "https://thumbnails.roblox.com/*",
     "https://www.rolimons.com/*",
     "https://api.rolimons.com/*"
   ],
@@ -14,12 +15,19 @@
   "service_worker": "background.js",
   "type": "module"
   },
+  "action": {
+    "default_popup": "popup.html"
+  },
   "web_accessible_resources": [
   {
     "resources": [
-      "injected.js",
+      "content.css",
       "icons/rolimons.svg",
-      "icons/projected.png"
+      "icons/projected.png",
+      "icons/bagempty.webp",
+      "icons/bagfull.webp",
+      "icons/return.jpg",
+      "icons/replacementimg.webp"
     ],
     "matches": ["https://www.roblox.com/*"]
   }],
@@ -27,11 +35,21 @@
     {
       "matches": [
         "https://www.roblox.com/users/*/trade*",
-        "https://www.roblox.com/trades/*/counter*"
+        "https://www.roblox.com/trades/*/counter*",
+        "https://www.roblox.com/trades*"
       ],
-      "js": ["content.js", "rolimons.js"],
-      "css": ["content.css"],
+      "js": ["popuphandling.js"],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://www.roblox.com/users/*/trade*",
+        "https://www.roblox.com/trades/*/counter*",
+        "https://www.roblox.com/trades*"
+      ],
+      "js": ["genericfunctions.js", "trade-composer.js", "trade-composer-values.js", "trades-list.js", "creatormode.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }

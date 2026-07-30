@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>trademarb</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup-shell">
+    <section class="setting-card">
+      <label class="setting-row" for="toggle-delete-useless-footer">
+        <span class="setting-meta">
+          <img class="setting-icon setting-icon--skull" src="icons/skull.svg" alt="">
+          <span class="setting-label">delete useless footer</span>
+        </span>
+        <span class="toggle-wrap">
+          <input
+            class="toggle-input"
+            id="toggle-delete-useless-footer"
+            type="checkbox"
+            data-setting="deleteUselessFooter"
+            checked
+          >
+          <span class="toggle-ui"></span>
+        </span>
+      </label>
+      <label class="setting-row" for="toggle-bag-of-holding">
+        <span class="setting-meta">
+          <img class="setting-icon setting-icon--bag" src="icons/bagfull.webp" alt="">
+          <span class="setting-label">bag of holding</span>
+        </span>
+        <span class="toggle-wrap">
+          <input
+            class="toggle-input"
+            id="toggle-bag-of-holding"
+            type="checkbox"
+            data-setting="bagOfHolding"
+          >
+          <span class="toggle-ui"></span>
+        </span>
+      </label>
+    </section>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>
