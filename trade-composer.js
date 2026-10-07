@@ -16,7 +16,7 @@
   window.__TIS_LOADED__ = true;
 
   const PAGE_SIZE = 10;
-  const REACT_PAGE_SIZE = 12;
+  const REACT_PAGE_SIZE = 10;
   const THUMBNAIL_PAGE_MEMORY_TTL_MS = 30 * 60 * 1000;
   const THUMBNAIL_MY_MEMORY_TTL_MS = 4 * 60 * 60 * 1000;
   const THUMBNAIL_MEMORY_MAX = 800;
