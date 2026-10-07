@@ -19,7 +19,7 @@
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const fetchWithRetry = async (tradeId, retryRateLimit) => {
       let lastError = null;
-      const maxAttempts = retryRateLimit ? 5 : 1;
+      const maxAttempts = retryRateLimit ? 2 : 1;
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         try {
           const res = await fetch(`https://trades.roblox.com/v2/trades/${tradeId}`, {
@@ -35,7 +35,7 @@
           lastError = error;
           if (attempt + 1 >= maxAttempts || !/http 429/i.test(String(error?.message || error))) throw error;
         }
-        await sleep(750 * (attempt + 1));
+        await sleep(2000 * (attempt + 1));
       }
       throw lastError || new Error("trade detail unavailable");
     };
@@ -544,7 +544,7 @@
     // A lightweight first-party auth check catches that case without asking
     // the user to reload the trade page.
     const now = Date.now();
-    if (now - lastAccountAuthCheckAt < 10000) return;
+    if (now - lastAccountAuthCheckAt < 60000) return;
     lastAccountAuthCheckAt = now;
     fetch("https://users.roblox.com/v1/users/authenticated", {
       method: "GET",
@@ -649,14 +649,9 @@
           setTimeout(hydrateVisibleTradeThumbnails, 150);
         })
         .catch(() => {
-          // Keep this selected summary in place and retry through the
-          // prioritized queue. Falling back to Roblox here is what leaves its
-          // spinner permanently stuck after a rate-limited request.
-          setTimeout(() => {
-            if (String(scope.data?.trade?.id || "") === String(trade.id)) {
-              scope.selectTrade(trade);
-            }
-          }, 3000);
+          // Keep the summary visible, but do not recursively retry a failed
+          // detail request. A 429 used to turn one selected trade into an
+          // endless request loop. A later user click can retry naturally.
         });
     };
   }
@@ -748,7 +743,7 @@
 
       const request = (async () => {
         let lastError = null;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
             const url =
               `https://trades.roblox.com/v1/trades/${status}` +
@@ -779,7 +774,7 @@
             lastError = error;
             if (!/429/.test(String(error?.message || error))) throw error;
           }
-          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+          await new Promise((resolve) => setTimeout(resolve, 2500 * (attempt + 1)));
         }
         throw lastError || new Error("trade page unavailable");
       })().finally(() => firstPartyTradePageRequests.delete(requestKey));
@@ -1094,7 +1089,7 @@
       getCachedTradePage(status)
         .then((summaries) => {
           renderCachedTradePage(scope, status, summaries);
-          revalidateCurrentTradePage(scope, status, true);
+          revalidateCurrentTradePage(scope, status, false);
         })
         .catch(() => revalidateTradePage(status, true)
           .then((summaries) => renderCachedTradePage(scope, status, summaries))
@@ -1127,10 +1122,7 @@
           // Waiting on Roblox here is what made scrolling look frozen even
           // though the extension already had the exact page to display.
           return getCachedTradePage(status, pageCursor)
-            .then((page) => {
-              revalidateTradePage(status, true, pageCursor).catch(() => {});
-              return appendPage(page);
-            })
+            .then(appendPage)
             .catch(() => revalidateTradePage(status, true, pageCursor).then(appendPage));
         };
 
@@ -1142,7 +1134,7 @@
   function revalidateCurrentTradePage(scope, status, force = false) {
     const now = Date.now();
     const lastStarted = lastRevalidationStartedAt.get(status) || 0;
-    if (!force && now - lastStarted < 20 * 1000) return;
+    if (!force && now - lastStarted < 5 * 60 * 1000) return;
     lastRevalidationStartedAt.set(status, now);
 
     revalidateTradePage(status, force).then((summaries) => {
@@ -1178,7 +1170,10 @@
     if (!status || !listState || currentTrades.length) {
       if (status) {
         nativeListLoadStartedAt.delete(status);
-        revalidateCurrentTradePage(scope, status);
+        // Inbound already uses Roblox's native fresh-list path. Do not issue a
+        // second background refresh for the same page. Cached tabs can refresh
+        // occasionally through the much longer cache TTL.
+        if (status !== "inbound") revalidateCurrentTradePage(scope, status);
       }
       return;
     }
@@ -1211,15 +1206,10 @@
     if (!scope) return;
     watchTradeCacheAccount(scope);
     if (accountSyncInFlight) return;
-    const status = normalizeStatus(scope.layout?.selectedTab?.value);
-    if (status && !initialPageRevalidation.has(status)) {
-      initialPageRevalidation.add(status);
-      revalidateCurrentTradePage(scope, status, true);
-    }
     recoverCachedTrades(scope);
   }
 
-  setInterval(checkCachedTrades, 750);
+  setInterval(checkCachedTrades, 1500);
 })();
 
 (() => {
@@ -3061,7 +3051,7 @@
     if (state.tradeDetailRequests.has(id)) return true;
 
     const failedAt = state.tradeDetailFailedAt.get(id);
-    if (failedAt && (Date.now() - failedAt) < 2500) {
+    if (failedAt && (Date.now() - failedAt) < 30000) {
       debug("skip trade detail fetch:cooldown", id);
       return true;
     }
@@ -3099,7 +3089,7 @@
     if (cached?.items?.length >= count) return Promise.resolve(cached.items.slice(0, count));
 
     const failedAt = state.tradeSummaryFailedAt.get(key);
-    if (failedAt && (Date.now() - failedAt) < 10000) {
+    if (failedAt && (Date.now() - failedAt) < 60000) {
       debug("skip trade summary fetch:cooldown", { key, count });
       return null;
     }
@@ -3159,6 +3149,20 @@
   }
 
   function ensureTradeSummariesLoaded(status, contexts) {
+    // The Angular rows usually already carry the exact summary objects that
+    // Roblox used to render the list. Reuse those instead of asking the list
+    // endpoint for data that is literally already in memory.
+    const contextSummaries = contexts
+      .map((context) => context.trade)
+      .filter((trade) => getTradeId(trade) && tradeMatchesStatus(trade, status));
+    if (contexts.length && contextSummaries.length === contexts.length) {
+      state.tradeSummaryCache.set(status, {
+        items: contextSummaries,
+        fetchedAt: Date.now(),
+      });
+      return false;
+    }
+
     const cached = state.tradeSummaryCache.get(status)?.items || [];
     const visibleTradeIds = contexts.map(({ tradeId }) => tradeId).filter(Boolean);
     const cachedTradeIds = new Set(cached.map((trade) => getTradeId(trade)).filter(Boolean));
@@ -3199,7 +3203,7 @@
     // Keep a long trade list from turning into an unbounded detail-request
     // burst.  Each finished batch schedules the next one, while cached
     // details still resolve immediately.
-    const maxNewRequests = 6;
+    const maxNewRequests = 2;
 
     contexts.forEach((context) => {
       const summaryTrade = resolveSummaryTradeForContext(context, summaries, summaryMap);
@@ -3309,7 +3313,7 @@
 
     if (ensureTradeRowDetailsLoaded(contexts, summaries, summaryMap)) {
       debug("render trade row values:waiting for detail data");
-      scheduleTradeRowValuesRender("waiting-for-detail-data", 120);
+      scheduleTradeRowValuesRender("waiting-for-detail-data", 600);
     }
 
     let renderedAnyTradeRowValue = false;
