@@ -86,6 +86,20 @@ async function fetchJson(url) {
   return res.json();
 }
 
+async function fetchJsonWithRetry(url, attempts = 3) {
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fetchJson(url);
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 >= attempts) break;
+      await sleep(200 * (attempt + 1));
+    }
+  }
+  throw lastError || new Error(`failed to fetch ${url}`);
+}
+
 async function getAuthedUserId() {
   const data = await fetchJson("https://users.roblox.com/v1/users/authenticated");
   if (!data?.id) throw new Error("couldn’t read authenticated user id (not logged in?)");
@@ -411,9 +425,243 @@ const ROLI_PLAYER_BADGE_STORAGE_PREFIX = "tis_roli_player_badges:";
 const thumbnailCache = new Map();
 const THUMBNAIL_CACHE_MS = 30 * 60 * 1000;
 const tradeDetailCache = new Map();
+const tradeDetailFetchRequests = new Map();
+const tradeDetailFetchQueue = [];
+let activeTradeDetailFetches = 0;
+const MAX_CONCURRENT_TRADE_DETAIL_FETCHES = 8;
 const TRADE_DETAIL_CACHE_MS = 2 * 60 * 1000;
 const tradeSummaryCache = new Map();
 const TRADE_SUMMARY_CACHE_MS = 30 * 1000;
+const TRADE_CACHE_STORAGE_PREFIX = "tis_trade_cache_v1:";
+const TRADE_CACHE_PAGE_LIMIT_PER_STATUS = 12;
+// There are twelve cached list pages per status (25 rows each).  Retain the
+// matching amount of immutable detail data so revisiting those rows does not
+// turn into another network burst.
+const TRADE_CACHE_DETAIL_LIMIT = 350;
+const TRADE_CACHE_REVALIDATE_MS = 20 * 1000;
+
+let tradeCacheUserId = null;
+let tradeCacheUserIdFetchedAt = 0;
+let tradeCacheAccountEpoch = 0;
+let tradeCacheWriteQueue = Promise.resolve();
+let persistentTradeDetailsKey = "";
+let persistentTradeDetails = null;
+let persistentTradeDetailsRead = null;
+
+function resetTradeRuntimeCachesForAccount(userId) {
+  const normalizedUserId = String(userId || "");
+  if (!/^\d+$/.test(normalizedUserId)) return false;
+  const changed = tradeCacheUserId !== normalizedUserId;
+  tradeCacheUserId = normalizedUserId;
+  tradeCacheUserIdFetchedAt = Date.now();
+  if (!changed) return false;
+
+  // Storage is already namespaced by user id. Clear only process-local data
+  // so a Roblox account switch never exposes one account's list while the
+  // other account's page is still alive.
+  tradeCacheAccountEpoch += 1;
+  tradeSummaryCache.clear();
+  tradeDetailCache.clear();
+  tradeDetailFetchRequests.clear();
+  tradeDetailFetchQueue.length = 0;
+  persistentTradeDetailsKey = "";
+  persistentTradeDetails = null;
+  persistentTradeDetailsRead = null;
+  cache.userId = null;
+  cache.items = null;
+  cache.fetchedAt = 0;
+  return true;
+}
+
+function pumpTradeDetailFetchQueue() {
+  while (activeTradeDetailFetches < MAX_CONCURRENT_TRADE_DETAIL_FETCHES && tradeDetailFetchQueue.length) {
+    const next = tradeDetailFetchQueue.shift();
+    activeTradeDetailFetches += 1;
+    fetchJsonWithRetry(`https://trades.roblox.com/v2/trades/${next.tradeId}`)
+      .then((trade) => {
+        if (!trade || typeof trade !== "object") throw new Error("missing trade payload");
+        if (!Array.isArray(trade.offers)) {
+          trade.offers = [trade.participantAOffer, trade.participantBOffer].filter(Boolean);
+        }
+        next.resolve(trade);
+      })
+      .catch(next.reject)
+      .finally(() => {
+        activeTradeDetailFetches -= 1;
+        pumpTradeDetailFetchQueue();
+      });
+  }
+}
+
+function fetchTradeDetailQueued(tradeId) {
+  const id = String(tradeId || "");
+  const pending = tradeDetailFetchRequests.get(id);
+  if (pending) return pending;
+
+  const request = new Promise((resolve, reject) => {
+    tradeDetailFetchQueue.push({ tradeId: id, resolve, reject });
+    pumpTradeDetailFetchQueue();
+  }).finally(() => {
+    tradeDetailFetchRequests.delete(id);
+  });
+  tradeDetailFetchRequests.set(id, request);
+  return request;
+}
+
+function getTradePageKey(cursor, limit, sortOrder) {
+  return `${String(cursor || "")}|${Math.max(1, Number(limit) || 25)}|${String(sortOrder || "Desc").toLowerCase()}`;
+}
+
+async function getTradeCacheUserId() {
+  const now = Date.now();
+  if (tradeCacheUserId && (now - tradeCacheUserIdFetchedAt) < 5 * 60 * 1000) {
+    return tradeCacheUserId;
+  }
+
+  // The user-id request is only for namespacing browser storage.  It must not
+  // prevent list values from loading on a profile where that endpoint or its
+  // host permission is unavailable; trade-detail fetching itself can still
+  // succeed with the existing trades host permission.
+  try {
+    tradeCacheUserId = String(await getAuthedUserId());
+  } catch {
+    tradeCacheUserId = "local-profile";
+  }
+  tradeCacheUserIdFetchedAt = now;
+  return tradeCacheUserId;
+}
+
+async function getStoredTradeCache() {
+  const userId = await getTradeCacheUserId();
+  const key = `${TRADE_CACHE_STORAGE_PREFIX}${userId}`;
+  const stored = (await chromeStorageLocalGet(key))[key];
+  return {
+    key,
+    value: stored && typeof stored === "object"
+      ? stored
+      : { version: 1, pages: {}, details: {} },
+  };
+}
+
+function normalizeTradePagePayload(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.data)) return null;
+  return {
+    data: payload.data,
+    nextPageCursor: payload.nextPageCursor ?? null,
+    previousPageCursor: payload.previousPageCursor ?? null,
+  };
+}
+
+async function readStoredTradePageEntry(status, cursor, limit, sortOrder) {
+  const { value } = await getStoredTradeCache();
+  const page = value?.pages?.[status]?.[getTradePageKey(cursor, limit, sortOrder)];
+  const payload = normalizeTradePagePayload(page?.payload);
+  return payload ? { payload, fetchedAt: Number(page?.fetchedAt || 0) } : null;
+}
+
+async function readStoredTradePage(status, cursor, limit, sortOrder) {
+  return (await readStoredTradePageEntry(status, cursor, limit, sortOrder))?.payload || null;
+}
+
+async function readPersistentTradeDetails() {
+  const userId = await getTradeCacheUserId();
+  const key = `${TRADE_CACHE_STORAGE_PREFIX}${userId}`;
+  if (persistentTradeDetailsKey === key && persistentTradeDetails) return persistentTradeDetails;
+  if (persistentTradeDetailsRead?.key === key) return persistentTradeDetailsRead.promise;
+
+  const promise = chromeStorageLocalGet(key).then((stored) => {
+    const cache = stored?.[key];
+    const details = cache?.details && typeof cache.details === "object" ? cache.details : {};
+    persistentTradeDetailsKey = key;
+    persistentTradeDetails = details;
+    return details;
+  }).finally(() => {
+    if (persistentTradeDetailsRead?.key === key) persistentTradeDetailsRead = null;
+  });
+  persistentTradeDetailsRead = { key, promise };
+  return promise;
+}
+
+function queueTradeCacheWrite(write) {
+  const accountEpoch = tradeCacheAccountEpoch;
+  const task = tradeCacheWriteQueue.then(async () => {
+    // A write queued by the previous Roblox account must never resolve its
+    // storage key after a switch and land in the new account's cache.
+    if (accountEpoch !== tradeCacheAccountEpoch) return false;
+    const { key, value } = await getStoredTradeCache();
+    if (accountEpoch !== tradeCacheAccountEpoch) return false;
+    return write(key, value);
+  });
+  tradeCacheWriteQueue = task.catch(() => {});
+  return task;
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "TIS_SYNC_TRADE_CACHE_ACCOUNT") return;
+
+  try {
+    const userId = String(msg.userId || "");
+    if (!/^\d+$/.test(userId)) throw new Error("bad account userId");
+    sendResponse({ ok: true, changed: resetTradeRuntimeCachesForAccount(userId) });
+  } catch (err) {
+    sendResponse({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+async function storeTradePage(status, cursor, limit, sortOrder, payload) {
+  const normalized = normalizeTradePagePayload(payload);
+  if (!normalized) return false;
+
+  return queueTradeCacheWrite(async (key, value) => {
+    const pages = value.pages && typeof value.pages === "object" ? value.pages : {};
+    const statusPages = pages[status] && typeof pages[status] === "object" ? pages[status] : {};
+    const pageKey = getTradePageKey(cursor, limit, sortOrder);
+    statusPages[pageKey] = { payload: normalized, fetchedAt: Date.now() };
+
+    const staleKeys = Object.keys(statusPages)
+      .sort((a, b) => Number(statusPages[b]?.fetchedAt || 0) - Number(statusPages[a]?.fetchedAt || 0))
+      .slice(TRADE_CACHE_PAGE_LIMIT_PER_STATUS);
+    staleKeys.forEach((staleKey) => delete statusPages[staleKey]);
+
+    pages[status] = statusPages;
+    await chromeStorageLocalSet({
+      [key]: {
+        version: 1,
+        pages,
+        details: value.details && typeof value.details === "object" ? value.details : {},
+      },
+    });
+    return true;
+  });
+}
+
+async function readStoredTradeDetail(tradeId) {
+  const entry = (await readPersistentTradeDetails())?.[tradeId];
+  return entry?.trade && typeof entry.trade === "object" ? entry.trade : null;
+}
+
+async function storeTradeDetail(tradeId, trade) {
+  if (!trade || typeof trade !== "object") return false;
+  return queueTradeCacheWrite(async (key, value) => {
+    const details = value.details && typeof value.details === "object" ? value.details : {};
+    details[tradeId] = { trade, fetchedAt: Date.now() };
+
+    const staleIds = Object.keys(details)
+      .sort((a, b) => Number(details[b]?.fetchedAt || 0) - Number(details[a]?.fetchedAt || 0))
+      .slice(TRADE_CACHE_DETAIL_LIMIT);
+    staleIds.forEach((staleId) => delete details[staleId]);
+
+    await chromeStorageLocalSet({
+      [key]: {
+        version: 1,
+        pages: value.pages && typeof value.pages === "object" ? value.pages : {},
+        details,
+      },
+    });
+    if (persistentTradeDetailsKey === key) persistentTradeDetails = details;
+    return true;
+  });
+}
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type !== "TIS_ROLIMONS_GET_ITEMDETAILS") return;
@@ -462,6 +710,42 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     roliCache.fetchedAt = Date.now();
 
     sendResponse({ ok: true, data: slim, cached: false });
+  })().catch((err) => {
+    sendResponse({ ok: false, error: String(err?.message || err) });
+  });
+
+  return true;
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "TIS_REVALIDATE_TRADE_PAGE") return;
+
+  (async () => {
+    const status = String(msg.status || "").trim().toLowerCase();
+    const cursor = String(msg.cursor || "");
+    const limit = Math.max(1, Number(msg.limit) || 25);
+    const sortOrder = String(msg.sortOrder || "Desc");
+    if (!["inbound", "outbound", "completed", "inactive"].includes(status)) {
+      throw new Error("bad status");
+    }
+
+    const stored = await readStoredTradePageEntry(status, cursor, limit, sortOrder);
+    const age = stored ? Date.now() - stored.fetchedAt : Infinity;
+    if (!msg.force && stored && age >= 0 && age < TRADE_CACHE_REVALIDATE_MS) {
+      sendResponse({ ok: true, payload: stored.payload, cached: true, revalidated: false, fetchedAt: stored.fetchedAt });
+      return;
+    }
+
+    const url =
+      `https://trades.roblox.com/v1/trades/${status}` +
+      `?cursor=${encodeURIComponent(cursor)}` +
+      `&limit=${encodeURIComponent(limit)}` +
+      `&sortOrder=${encodeURIComponent(sortOrder)}`;
+    const payload = await fetchJsonWithRetry(url);
+    if (!await storeTradePage(status, cursor, limit, sortOrder, payload)) {
+      throw new Error("could not store revalidated trade page");
+    }
+    sendResponse({ ok: true, payload: normalizeTradePagePayload(payload), cached: false, revalidated: true, fetchedAt: Date.now() });
   })().catch((err) => {
     sendResponse({ ok: false, error: String(err?.message || err) });
   });
@@ -562,6 +846,75 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "TIS_GET_TRADE_PAGE_CACHE") return;
+
+  (async () => {
+    const status = String(msg.status || "").trim().toLowerCase();
+    const cursor = String(msg.cursor || "");
+    const limit = Math.max(1, Number(msg.limit) || 25);
+    const sortOrder = String(msg.sortOrder || "Desc");
+    if (!["inbound", "outbound", "completed", "inactive"].includes(status)) {
+      throw new Error("bad status");
+    }
+
+    const payload = await readStoredTradePage(status, cursor, limit, sortOrder);
+    sendResponse({ ok: true, payload, cached: Boolean(payload) });
+  })().catch((err) => {
+    sendResponse({ ok: false, error: String(err?.message || err) });
+  });
+
+  return true;
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "TIS_STORE_TRADE_PAGE_CACHE") return;
+
+  (async () => {
+    const status = String(msg.status || "").trim().toLowerCase();
+    const cursor = String(msg.cursor || "");
+    const limit = Math.max(1, Number(msg.limit) || 25);
+    const sortOrder = String(msg.sortOrder || "Desc");
+    if (!["inbound", "outbound", "completed", "inactive"].includes(status)) {
+      throw new Error("bad status");
+    }
+
+    const stored = await storeTradePage(status, cursor, limit, sortOrder, msg.payload);
+    sendResponse({ ok: stored });
+  })().catch((err) => {
+    sendResponse({ ok: false, error: String(err?.message || err) });
+  });
+
+  return true;
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "TIS_STORE_TRADE_DETAILS") return;
+
+  (async () => {
+    const tradeId = String(msg.tradeId || "");
+    if (!/^\d+$/.test(tradeId)) throw new Error("bad tradeId");
+
+    const trade = msg.trade;
+    if (!trade || typeof trade !== "object") throw new Error("missing trade payload");
+    if (!Array.isArray(trade.offers)) {
+      trade.offers = [trade.participantAOffer, trade.participantBOffer].filter(Boolean);
+    }
+
+    tradeDetailCache.set(tradeId, { trade, fetchedAt: Date.now() });
+    // Do not make the live page wait for chrome.storage.  A long trade list
+    // can request hundreds of immutable details at once; serialising those
+    // durable writes before responding made later rows look unenhanced even
+    // though their network responses had already arrived.
+    storeTradeDetail(tradeId, trade).catch(() => {});
+    sendResponse({ ok: true });
+  })().catch((err) => {
+    sendResponse({ ok: false, error: String(err?.message || err) });
+  });
+
+  return true;
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type !== "TIS_FETCH_TRADE_DETAILS") return;
 
   (async () => {
@@ -575,18 +928,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
 
-    const trade = await fetchJson(`https://trades.roblox.com/v2/trades/${tradeId}`);
-    if (!trade || typeof trade !== "object") throw new Error("missing trade payload");
-
-    if (!Array.isArray(trade.offers)) {
-      trade.offers = [trade.participantAOffer, trade.participantBOffer].filter(Boolean);
+    const storedTrade = await readStoredTradeDetail(tradeId);
+    if (storedTrade) {
+      tradeDetailCache.set(tradeId, { trade: storedTrade, fetchedAt: now });
+      sendResponse({ ok: true, trade: storedTrade, cached: true, persistent: true });
+      return;
     }
+
+    const trade = await fetchTradeDetailQueued(tradeId);
 
     tradeDetailCache.set(tradeId, {
       trade,
       fetchedAt: now,
     });
-
+    // Persist independently of the response so list decoration is driven by
+    // the fetched data, not by a potentially long storage write queue.
+    storeTradeDetail(tradeId, trade).catch(() => {});
     sendResponse({ ok: true, trade, cached: false });
   })().catch((err) => {
     sendResponse({ ok: false, error: String(err?.message || err) });
@@ -613,12 +970,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     while (liveCache.items.length < wantedCount && liveCache.nextPageCursor !== null) {
       const cursor = liveCache.nextPageCursor || "";
-      const url =
-        `https://trades.roblox.com/v1/trades/${status}` +
-        `?cursor=${encodeURIComponent(cursor)}` +
-        `&limit=25&sortOrder=Desc`;
+      let page = await readStoredTradePage(status, cursor, 25, "Desc");
+      if (!page) {
+        const url =
+          `https://trades.roblox.com/v1/trades/${status}` +
+          `?cursor=${encodeURIComponent(cursor)}` +
+          `&limit=25&sortOrder=Desc`;
 
-      const page = await fetchJson(url);
+        page = await fetchJsonWithRetry(url);
+        await storeTradePage(status, cursor, 25, "Desc", page);
+      }
       const items = Array.isArray(page?.data) ? page.data : [];
       liveCache.items.push(...items);
       liveCache.nextPageCursor = page?.nextPageCursor ?? null;

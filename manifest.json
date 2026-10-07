@@ -6,6 +6,7 @@
   "permissions": ["storage", "declarativeNetRequest", "declarativeNetRequestWithHostAccess"],
   "host_permissions": [
     "https://www.roblox.com/*",
+    "https://users.roblox.com/*",
     "https://trades.roblox.com/*",
     "https://thumbnails.roblox.com/*",
     "https://www.rolimons.com/*",

@@ -19,6 +19,7 @@
   const renderItemCardRoliValueRow = shared.renderItemCardRoliValueRow || (() => null);
   const buildTradeDeltaMarkup = shared.buildTradeDeltaMarkup || ((rapDiff, valueDiff) => ({ rowStateClass: "", markup: "" }));
   const bridgeRequest = shared.bridgeRequest || (async () => { throw new Error("bridge unavailable"); });
+  const getReactTradeItem = shared.getReactTradeItem || (() => null);
 
   const state = {
     data: null, // { [assetId]: { name:string|null, value:number|null, projected:boolean } }
@@ -203,6 +204,9 @@
 
   function getTradeItemDataFromElement(element) {
     if (!element) return null;
+
+    const reactItem = getReactTradeItem(element);
+    if (reactItem) return reactItem;
 
     const candidates = [
       element,
@@ -686,6 +690,8 @@
   }
 
   function getRapFromOfferItem(item) {
+    const reactRap = Number(getTradeItemDataFromElement(item)?.recentAveragePrice);
+    if (Number.isFinite(reactRap) && reactRap >= 0) return reactRap;
     return parseNum(
       item.querySelector(".item-card-price .text-robux")?.textContent ||
       item.querySelector(".item-card-price")?.textContent ||
@@ -753,7 +759,7 @@
 
   function computeOfferTotals(panel) {
     const items = panel.querySelectorAll(
-      ".trade-request-item[data-collectibleiteminstanceid], .item-card-container[data-collectibleiteminstanceid]"
+      ".trade-request-item:not(.blank-item), .item-card-container[data-collectibleiteminstanceid]"
     );
     let rap = getRobuxFromPanel(panel);
     let value = rap;
@@ -1877,6 +1883,7 @@
     // fallback: if roli has no value, show roblox RAP again (blue)
     const rapText =
     card.querySelector(".item-card-caption .item-card-price .text-robux")?.textContent?.trim() ||
+    card.querySelector(".item-card-caption .item-card-price .text-robux-tile")?.textContent?.trim() ||
     card.querySelector(".item-card-caption .item-card-price")?.textContent?.trim() ||
     "-";
 
@@ -1969,7 +1976,7 @@
     if (!state.data || !isTradePage()) return;
     ensureStyles();
     const cards = document.querySelectorAll(".item-card-container");
-    const offerItems = document.querySelectorAll(".trade-request-item[data-collectibleiteminstanceid]");
+    const offerItems = document.querySelectorAll(".trade-request-item:not(.blank-item)");
     debug("decorate pass", { cards: cards.length, url: location.href });
     cards.forEach(decorateCard);
     offerItems.forEach(decorateOfferItem);

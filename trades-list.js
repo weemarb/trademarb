@@ -1,24 +1,127 @@
 ﻿(() => {
   const { origin, pathname } = location;
   if (origin !== "https://www.roblox.com") return;
+  // This file is also injected on /counter routes. Do not wrap that page's
+  // network primitives: it owns a different Angular controller and must keep
+  // Roblox's native request flow intact.
+  if (!/^\/trades\/?$/i.test(pathname)) return;
   if (window.__TIS_TRADES_LIST_PAGE_TAP__) return;
   window.__TIS_TRADES_LIST_PAGE_TAP__ = true;
 
-  function getTradesListStatusFromUrl(rawUrl) {
+  // Brave may allow authenticated trade requests from the page while blocking
+  // the extension worker's cookie access.  Keep those fallback requests in a
+  // single shared queue so list decoration cannot rate-limit a selected trade.
+  if (typeof window.TIS_FETCH_TRADE_DETAIL_FIRST_PARTY !== "function") {
+    const pending = new Map();
+    const queue = [];
+    let active = false;
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const fetchWithRetry = async (tradeId, retryRateLimit) => {
+      let lastError = null;
+      const maxAttempts = retryRateLimit ? 5 : 1;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        try {
+          const res = await fetch(`https://trades.roblox.com/v2/trades/${tradeId}`, {
+            method: "GET",
+            credentials: "include",
+            headers: { accept: "application/json" },
+            cache: "no-store",
+          });
+          if (res.ok) return res.json();
+          lastError = new Error(`trade detail http ${res.status}`);
+          if (res.status !== 429 || attempt + 1 >= maxAttempts) throw lastError;
+        } catch (error) {
+          lastError = error;
+          if (attempt + 1 >= maxAttempts || !/http 429/i.test(String(error?.message || error))) throw error;
+        }
+        await sleep(750 * (attempt + 1));
+      }
+      throw lastError || new Error("trade detail unavailable");
+    };
+
+    const pump = () => {
+      if (active || !queue.length) return;
+      const next = queue.shift();
+      active = true;
+      fetchWithRetry(next.tradeId, next.priority)
+        .then(next.resolve, (error) => {
+          next.rateLimited = /http 429/i.test(String(error?.message || error));
+          next.reject(error);
+        })
+        .finally(() => {
+          pending.delete(next.tradeId);
+          active = false;
+          // An off-screen row that receives 429 must yield the request slot
+          // rather than continually starving a user-selected trade.
+          setTimeout(pump, next.rateLimited ? 1800 : 250);
+        });
+    };
+
+    window.TIS_FETCH_TRADE_DETAIL_FIRST_PARTY = (tradeId, priority = false) => {
+      const id = String(tradeId || "");
+      if (!/^\d+$/.test(id)) return Promise.reject(new Error("invalid trade id"));
+      const existing = pending.get(id);
+      if (existing) {
+        if (priority && !active) {
+          const queuedIndex = queue.indexOf(existing.entry);
+          if (queuedIndex > 0) queue.unshift(queue.splice(queuedIndex, 1)[0]);
+        }
+        return existing.promise;
+      }
+
+      let entry;
+      const promise = new Promise((resolve, reject) => {
+        entry = { tradeId: id, resolve, reject, priority };
+        if (priority) queue.unshift(entry);
+        else queue.push(entry);
+        pump();
+      });
+      pending.set(id, { promise, entry });
+      return promise;
+    };
+  }
+
+  function getTradesListRequestFromUrl(rawUrl) {
     try {
       const url = new URL(rawUrl, location.href);
       if (url.origin !== "https://trades.roblox.com") return null;
       const match = url.pathname.match(/^\/v1\/trades\/([^/]+)$/i);
       if (!match) return null;
       const status = String(match[1] || "").trim().toLowerCase();
-      return ["inbound", "outbound", "completed", "inactive"].includes(status) ? status : null;
+      if (!["inbound", "outbound", "completed", "inactive"].includes(status)) return null;
+      return {
+        status,
+        cursor: url.searchParams.get("cursor") || "",
+        limit: Math.max(1, Number(url.searchParams.get("limit")) || 25),
+        sortOrder: url.searchParams.get("sortOrder") || "Desc",
+      };
     } catch {
       return null;
     }
   }
 
-  function emitTradesListPayload(status, payload) {
+  function getTradesListStatusFromUrl(rawUrl) {
+    return getTradesListRequestFromUrl(rawUrl)?.status || null;
+  }
+
+  function persistTradePage(request, payload) {
+    if (!request || !payload || !Array.isArray(payload.data)) return;
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function") return;
+    bridge("runtimeSendMessage", {
+      type: "TIS_STORE_TRADE_PAGE_CACHE",
+      status: request.status,
+      cursor: request.cursor,
+      limit: request.limit,
+      sortOrder: request.sortOrder,
+      payload,
+    }, 10000).catch(() => {});
+  }
+
+  function emitTradesListPayload(status, payload, request = null) {
     if (!status || !payload || typeof payload !== "object") return;
+    persistTradePage(request, payload);
     window.postMessage({
       type: "TIS_TRADES_LIST_DATA",
       status,
@@ -28,6 +131,14 @@
 
   function emitTradeDetailPayload(tradeId, trade) {
     if (!tradeId || !trade || typeof trade !== "object") return;
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge === "function") {
+      bridge("runtimeSendMessage", {
+        type: "TIS_STORE_TRADE_DETAILS",
+        tradeId: String(tradeId),
+        trade,
+      }, 10000).catch(() => {});
+    }
     window.postMessage({
       type: "TIS_TRADE_DETAIL_DATA",
       tradeId: String(tradeId),
@@ -43,86 +154,1072 @@
     }, "*");
   }
 
-  async function fetchTradeDetailWithPage(tradeId) {
-    const res = await fetch(`https://trades.roblox.com/v2/trades/${tradeId}`, {
-      method: "GET",
-      credentials: "include",
-      headers: {
-        accept: "application/json",
-      },
-      cache: "no-store",
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`http ${res.status}: ${text.slice(0, 200)}`);
-    }
-
-    const trade = await res.json();
-    if (!Array.isArray(trade?.offers)) {
-      trade.offers = [trade?.participantAOffer, trade?.participantBOffer].filter(Boolean);
-    }
-    return trade;
-  }
-
-  const originalFetch = window.fetch;
-  if (typeof originalFetch === "function") {
-    window.fetch = async function tisTradesListFetchTap(input, init) {
-      const response = await originalFetch.apply(this, arguments);
-      try {
-        const url = typeof input === "string" ? input : input?.url;
-        const status = getTradesListStatusFromUrl(url);
-        if (status) {
-          response.clone().json()
-            .then((payload) => emitTradesListPayload(status, payload))
-            .catch(() => {});
-        }
-      } catch {}
-      return response;
-    };
-  }
-
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalSend = XMLHttpRequest.prototype.send;
-
-  XMLHttpRequest.prototype.open = function tisTradesListXhrOpen(method, url) {
-    this.__tisTradesListUrl = typeof url === "string" ? url : String(url || "");
-    return originalOpen.apply(this, arguments);
-  };
-
-  XMLHttpRequest.prototype.send = function tisTradesListXhrSend(body) {
-    const status = getTradesListStatusFromUrl(this.__tisTradesListUrl);
-    if (status) {
-      this.addEventListener("loadend", function onTisTradesListLoadEnd() {
-        try {
-          if (this.readyState !== 4 || this.status < 200 || this.status >= 300) return;
-          const payload = JSON.parse(this.responseText || "null");
-          emitTradesListPayload(status, payload);
-        } catch {}
-      }, { once: true });
-    }
-
-    return originalSend.apply(this, arguments);
-  };
-
+  // Detail requests are intentionally handled by the extension service
+  // worker.  The list-value renderer communicates through this event so it
+  // never makes its own page-level request burst.
   const tradeDetailRequestState = new Map();
   window.addEventListener("message", (ev) => {
     const msg = ev?.data;
     if (msg?.type !== "TIS_REQUEST_TRADE_DETAILS") return;
 
     const tradeId = String(msg.tradeId || "");
-    if (!/^\d+$/.test(tradeId)) return;
-    if (tradeDetailRequestState.has(tradeId)) return;
+    if (!/^\d+$/.test(tradeId) || tradeDetailRequestState.has(tradeId)) return;
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function") {
+      emitTradeDetailError(tradeId, "trade cache bridge unavailable");
+      return;
+    }
 
-    const request = fetchTradeDetailWithPage(tradeId)
-      .then((trade) => emitTradeDetailPayload(tradeId, trade))
-      .catch((err) => emitTradeDetailError(tradeId, String(err?.message || err)))
-      .finally(() => {
-        tradeDetailRequestState.delete(tradeId);
-      });
+    const request = bridge("runtimeSendMessage", {
+      type: "TIS_FETCH_TRADE_DETAILS",
+      tradeId,
+    }, 15000)
+      .then((response) => {
+        if (!response?.ok || !response.trade) {
+          throw new Error(response?.error || "trade detail unavailable");
+        }
+        emitTradeDetailPayload(tradeId, response.trade);
+      })
+      .catch((error) => emitTradeDetailError(tradeId, String(error?.message || error)))
+      .finally(() => tradeDetailRequestState.delete(tradeId));
 
     tradeDetailRequestState.set(tradeId, request);
   });
+})();
+
+(() => {
+  if (location.origin !== "https://www.roblox.com") return;
+  if (window.__TIS_COUNTER_CACHE_RECOVERY__) return;
+  window.__TIS_COUNTER_CACHE_RECOVERY__ = true;
+
+  let requestInFlight = false;
+  let nextAttemptAt = 0;
+  let requestedTradeId = "";
+  let routeStartedAt = 0;
+  let recoveryApplied = false;
+  const NATIVE_COUNTER_GRACE_MS = 5000;
+  const inventoryRetryStates = new WeakMap();
+
+  function getCounterTradeId() {
+    return location.pathname.match(/^\/trades\/(\d+)\/counter\/?$/i)?.[1] || "";
+  }
+
+  function getCounterScope() {
+    if (!window.angular?.element) return null;
+    const root = document.querySelector('[ng-controller="tradeRequestController"]');
+    if (!root) return null;
+    try {
+      let scope = window.angular.element(root).scope?.() || window.angular.element(root).isolateScope?.() || null;
+      for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.$parent) {
+        if (scope?.data && scope?.layout && typeof scope?.addOffer === "function") return scope;
+      }
+    } catch {}
+    return null;
+  }
+
+  function runInScope(scope, fn) {
+    if (typeof scope?.$applyAsync === "function") scope.$applyAsync(fn);
+    else {
+      try { scope?.$apply?.(fn); } catch { fn(); }
+    }
+  }
+
+  // The trade-detail endpoint's offers are transport objects.  Counter's
+  // Angular template renders `offer.slots`, labels, and isMyOffer, all of
+  // which are created by its own addOffer method.  Assigning the endpoint
+  // array directly therefore produces a half-rendered counter (RAP totals
+  // but no cards or value totals).
+  function hydrateCounterOffers(scope, sourceOffers, detail) {
+    const offers = Array.isArray(sourceOffers) ? sourceOffers : [];
+    if (!offers.length) return false;
+
+    if (typeof scope?.clearOffers !== "function" || typeof scope?.addOffer !== "function") {
+      return false;
+    }
+
+    scope.clearOffers();
+    offers.forEach((offer) => {
+      const user = { ...(offer?.user || {}) };
+      user.nameForDisplay ||= detail?.user?.nameForDisplay || user.displayName || user.name || "";
+      const items = (Array.isArray(offer?.items) ? offer.items : []).map((item) => {
+        if (!item || typeof item !== "object") return item;
+        return {
+          ...item,
+          id: item.id || item.collectibleItemInstanceId || item.collectibleItemId,
+        };
+      });
+      scope.addOffer(user, Number(offer?.robux) || 0, items);
+    });
+
+    scope.data.counterTradeId = Number(getCounterTradeId()) || getCounterTradeId();
+    scope.partner = detail?.user || scope.partner || null;
+    scope.layout.loaded = true;
+    scope.layout.tradeRequestView = "offers";
+    try { scope.$broadcast?.("reloadInventory"); } catch {}
+    return true;
+  }
+
+  function preventLateNativeOfferDuplicates(scope) {
+    if (scope?.__tisCounterOfferGuardInstalled || typeof scope?.addOffer !== "function") return;
+    const nativeAddOffer = scope.addOffer;
+    scope.__tisCounterOfferGuardInstalled = true;
+    scope.addOffer = function guardedAddOffer(user, robux, items) {
+      const userId = String(user?.id || "");
+      const existingOffers = Array.isArray(scope.data?.offers) ? scope.data.offers : [];
+      // openCounterTrade clears the list before its request settles, then
+      // appends each remote offer in its callback. Once our cache has rebuilt
+      // the two sides, that late callback must not append a second copy.
+      if (userId && existingOffers.some((offer) => String(offer?.user?.id || "") === userId)) return;
+      return nativeAddOffer.apply(this, arguments);
+    };
+  }
+
+  async function fetchCounterDetail(tradeId) {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge === "function") {
+      try {
+        const response = await bridge("runtimeSendMessage", { type: "TIS_FETCH_TRADE_DETAILS", tradeId }, 15000);
+        if (response?.ok && response.trade) return response.trade;
+      } catch {}
+    }
+
+    // The normal Brave profile can deny cookies to extension-worker fetches.
+    // This is one explicit, first-party counter request with measured 429
+    // retries, never a list-wide request burst.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const response = await fetch(`https://trades.roblox.com/v2/trades/${tradeId}`, {
+        method: "GET",
+        credentials: "include",
+        headers: { accept: "application/json" },
+        cache: "no-store",
+      });
+      if (response.ok) {
+        const detail = await response.json();
+        if (typeof bridge === "function") {
+          bridge("runtimeSendMessage", { type: "TIS_STORE_TRADE_DETAILS", tradeId, trade: detail }, 10000).catch(() => {});
+        }
+        return detail;
+      }
+      if (response.status !== 429 || attempt === 3) throw new Error(`counter trade detail http ${response.status}`);
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+    throw new Error("counter trade detail unavailable");
+  }
+
+  function recoverCounter() {
+    const tradeId = getCounterTradeId();
+    if (!tradeId) {
+      requestedTradeId = "";
+      requestInFlight = false;
+      nextAttemptAt = 0;
+      routeStartedAt = 0;
+      recoveryApplied = false;
+      return;
+    }
+
+    // Counter can be opened by Roblox's client-side router.  In that case
+    // this content script was created on /trades, so detect the new trade
+    // here instead of relying on a document-start URL match.
+    if (tradeId !== requestedTradeId) {
+      requestedTradeId = tradeId;
+      requestInFlight = false;
+      nextAttemptAt = 0;
+      routeStartedAt = Date.now();
+      recoveryApplied = false;
+    }
+
+    const scope = getCounterScope();
+    if (!scope || requestInFlight || Date.now() < nextAttemptAt) return;
+    // Allow Roblox's own openCounterTrade flow to finish first. Applying a
+    // cached offer while that async flow is still adding offers can duplicate
+    // both inventory panels and squeeze the cards into the wrong layout.
+    if (Date.now() - routeStartedAt < NATIVE_COUNTER_GRACE_MS) return;
+
+    const currentOffers = Array.isArray(scope.data?.offers) ? scope.data.offers : [];
+    const hasRenderedOfferLayout =
+      currentOffers.length > 0 &&
+      currentOffers.every((offer) => Array.isArray(offer?.slots)) &&
+      Boolean(scope.layout?.loaded);
+    if (hasRenderedOfferLayout) return;
+    // A cache recovery is deliberately a one-shot operation per counter
+    // route. Native rendering and our recovery must never both append offers.
+    if (recoveryApplied) return;
+
+    requestInFlight = true;
+    fetchCounterDetail(tradeId)
+      .then((detail) => {
+        if (tradeId !== getCounterTradeId()) return;
+        const offers = Array.isArray(detail?.offers)
+          ? detail.offers
+          : [detail?.participantAOffer, detail?.participantBOffer].filter(Boolean);
+        if (!offers.length) throw new Error("counter detail has no offers");
+        recoveryApplied = true;
+        runInScope(scope, () => {
+          const nativeOffers = Array.isArray(scope.data?.offers) ? scope.data.offers : [];
+          const nativeFinished =
+            nativeOffers.length > 0 &&
+            nativeOffers.every((offer) => Array.isArray(offer?.slots)) &&
+            Boolean(scope.layout?.loaded);
+          if (!nativeFinished) {
+            preventLateNativeOfferDuplicates(scope);
+            hydrateCounterOffers(scope, offers, detail);
+          }
+        });
+      })
+      .catch(() => {
+        if (tradeId !== getCounterTradeId()) return;
+        // Keep retrying the one counter request after Roblox's rate-limit
+        // window without sending the user back to an empty native spinner.
+        nextAttemptAt = Date.now() + 5000;
+      })
+      .finally(() => {
+        if (tradeId === getCounterTradeId()) requestInFlight = false;
+      });
+  }
+
+  function retryFailedPartnerInventories() {
+    if (!getCounterTradeId()) return;
+    document.querySelectorAll(".trade-inventory-panel").forEach((panel) => {
+      let scope = null;
+      try {
+        scope = window.angular?.element(panel).scope?.() || window.angular?.element(panel).isolateScope?.() || null;
+      } catch {}
+      if (!scope || scope.inventoryData?.isMe || scope.loading || !scope.loadFailed || typeof scope.reload !== "function") return;
+
+      const existingItems = scope.inventoryData?.tradableItems;
+      if (Array.isArray(existingItems) && existingItems.length) {
+        inventoryRetryStates.delete(scope);
+        return;
+      }
+
+      const now = Date.now();
+      let state = inventoryRetryStates.get(scope);
+      if (!state) {
+        // A failed first request is normally Roblox's 429 window. Wait before
+        // retrying rather than immediately issuing the same request again.
+        state = { attempts: 0, nextAttemptAt: now + 8000 };
+        inventoryRetryStates.set(scope, state);
+        return;
+      }
+      if (state.attempts >= 3 || now < state.nextAttemptAt) return;
+
+      state.attempts += 1;
+      state.nextAttemptAt = now + (8000 * (state.attempts + 1));
+      runInScope(scope, () => scope.reload());
+    });
+  }
+
+  // Keep watching for the lifetime of the trades app. Roblox swaps counter
+  // routes without a document reload and can also clear a successful counter
+  // controller several seconds after first rendering it.
+  setInterval(() => {
+    recoverCounter();
+    retryFailedPartnerInventories();
+  }, 350);
+  recoverCounter();
+})();
+
+(() => {
+  if (window.__TIS_TRADES_LIST_CACHE_RECOVERY__) return;
+  window.__TIS_TRADES_LIST_CACHE_RECOVERY__ = true;
+
+  const VALID_STATUSES = new Set(["inbound", "outbound", "completed", "inactive"]);
+  let recoveryInFlight = null;
+  let lastRecoveryAttempt = "";
+  let lastRecoveryAttemptAt = 0;
+  const visibleListCacheKeys = new Map();
+  const visibleListPayloadKeys = new Map();
+  const visibleListPayloadAt = new Map();
+  const lastRevalidationStartedAt = new Map();
+  const initialPageRevalidation = new Set();
+  const nativeListLoadStartedAt = new Map();
+  const NATIVE_LIST_GRACE_MS = 6000;
+  const firstPartyTradePageRequests = new Map();
+  let activeTradeAccountId = "";
+  let accountSyncInFlight = null;
+  let lastAccountAuthCheckAt = 0;
+  let visibleThumbnailSignature = "";
+  let visibleAvatarSignature = "";
+
+  function normalizeStatus(status) {
+    const value = String(status || "").trim().toLowerCase();
+    return VALID_STATUSES.has(value) ? value : null;
+  }
+
+  function getTradesListScope() {
+    if (!window.angular?.element) return null;
+    const root = document.querySelector('[ng-controller="tradesListController"]');
+    if (!root) return null;
+
+    try {
+      let scope = window.angular.element(root).scope?.() || window.angular.element(root).isolateScope?.() || null;
+      for (let depth = 0; scope && depth < 6; depth += 1, scope = scope.$parent) {
+        if (scope?.data?.trades && scope?.data?.tradesList && scope?.layout?.selectedTab) return scope;
+      }
+    } catch {}
+    return null;
+  }
+
+  function getTradeAccountIdFromPage() {
+    const candidates = [
+      document.querySelector('meta[name="user-data"]')?.getAttribute("data-userid"),
+      document.documentElement?.getAttribute("data-userid"),
+      document.querySelector("#rbx-body")?.getAttribute("data-userid"),
+      window.Roblox?.CurrentUser?.userId,
+      window.Roblox?.CurrentUser?.id,
+      window.Roblox?.UserId,
+    ];
+    for (const candidate of candidates) {
+      const id = String(candidate || "");
+      if (/^\d+$/.test(id)) return id;
+    }
+    return "";
+  }
+
+  function resetInPageTradeCachesForAccountSwitch() {
+    recoveryInFlight = null;
+    lastRecoveryAttempt = "";
+    lastRecoveryAttemptAt = 0;
+    visibleListCacheKeys.clear();
+    visibleListPayloadKeys.clear();
+    visibleListPayloadAt.clear();
+    lastRevalidationStartedAt.clear();
+    initialPageRevalidation.clear();
+    nativeListLoadStartedAt.clear();
+    visibleThumbnailSignature = "";
+    visibleAvatarSignature = "";
+  }
+
+  function restartCurrentTradeListForAccount(scope, accountId) {
+    if (activeTradeAccountId !== accountId) return;
+    const tab = scope.layout?.selectedTab;
+    if (!tab) return;
+    // Re-enter the native tab pipeline after clearing every in-page reference
+    // to the previous account. This avoids requiring a browser refresh after
+    // Roblox's account switcher changes the authenticated session.
+    runInScope(scope, () => {
+      if (activeTradeAccountId !== accountId) return;
+      scope.data.trades = [];
+      scope.data.trade = null;
+      if (scope.data.tradesList) {
+        scope.data.tradesList.loading = true;
+        scope.data.tradesList.noResults = false;
+      }
+      delete scope.__tisCachedPageSignature;
+      delete scope.__tisCachedNextPageCursor;
+    });
+    setTimeout(() => {
+      if (activeTradeAccountId !== accountId || normalizeStatus(scope.layout?.selectedTab?.value) !== normalizeStatus(tab.value)) return;
+      scope.selectTab?.(tab);
+    }, 0);
+  }
+
+  function syncTradeCacheAccount(scope, userId) {
+    const id = String(userId || "");
+    if (!/^\d+$/.test(id) || id === activeTradeAccountId) return;
+    const hadActiveAccount = Boolean(activeTradeAccountId);
+    activeTradeAccountId = id;
+    if (hadActiveAccount) {
+      resetInPageTradeCachesForAccountSwitch();
+      window.postMessage({ type: "TIS_TRADE_ACCOUNT_CHANGED", userId: id }, "*");
+    }
+
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    const sync = typeof bridge === "function"
+      ? bridge("runtimeSendMessage", { type: "TIS_SYNC_TRADE_CACHE_ACCOUNT", userId: id }, 10000)
+      : Promise.resolve({ ok: false });
+    accountSyncInFlight = Promise.resolve(sync)
+      .catch(() => null)
+      .finally(() => {
+        accountSyncInFlight = null;
+        if (hadActiveAccount) restartCurrentTradeListForAccount(scope, id);
+      });
+  }
+
+  function watchTradeCacheAccount(scope) {
+    const pageUserId = getTradeAccountIdFromPage();
+    if (pageUserId) syncTradeCacheAccount(scope, pageUserId);
+
+    // Some Roblox account switches leave the old user id in page markup.
+    // A lightweight first-party auth check catches that case without asking
+    // the user to reload the trade page.
+    const now = Date.now();
+    if (now - lastAccountAuthCheckAt < 10000) return;
+    lastAccountAuthCheckAt = now;
+    fetch("https://users.roblox.com/v1/users/authenticated", {
+      method: "GET",
+      credentials: "include",
+      headers: { accept: "application/json" },
+      cache: "no-store",
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => syncTradeCacheAccount(scope, data?.id))
+      .catch(() => {});
+  }
+
+  function runInScope(scope, fn) {
+    if (!scope || typeof fn !== "function") return;
+    if (typeof scope.$applyAsync === "function") {
+      scope.$applyAsync(fn);
+      return;
+    }
+    try {
+      scope.$apply(fn);
+    } catch {
+      fn();
+    }
+  }
+
+  function normalizeTradeSummary(trade, status) {
+    if (!trade || typeof trade !== "object") return null;
+    const id = String(trade.id || "");
+    if (!/^\d+$/.test(id)) return null;
+
+    const user = trade.user && typeof trade.user === "object" ? { ...trade.user } : {};
+    user.nameForDisplay ||= user.displayName || user.name || "";
+    return {
+      ...trade,
+      id: Number.isSafeInteger(Number(id)) ? Number(id) : id,
+      user,
+      tradeStatusType: trade.tradeStatusType || `${status.slice(0, 1).toUpperCase()}${status.slice(1)}`,
+    };
+  }
+
+  function normalizeTradeDetail(trade, summary) {
+    if (!trade || typeof trade !== "object") return null;
+    const detail = { ...trade };
+    if (!Array.isArray(detail.offers)) {
+      detail.offers = [detail.participantAOffer, detail.participantBOffer].filter(Boolean);
+    }
+    detail.offers.forEach((offer) => {
+      (offer?.items || []).forEach((item) => {
+        if (item && !item.id) item.id = item.collectibleItemInstanceId;
+      });
+    });
+    detail.id = summary?.id ?? detail.id;
+    detail.expiration = summary?.expiration ?? detail.expiration;
+    detail.tradeStatusType = summary?.tradeStatusType ?? detail.tradeStatusType;
+    detail.user = summary?.user ?? detail.user;
+    return detail;
+  }
+
+  async function fetchSelectedTradeDetail(tradeId, summary) {
+    const id = String(tradeId || "");
+    if (!/^\d+$/.test(id)) throw new Error("invalid trade id");
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+
+    if (typeof bridge === "function") {
+      try {
+        const response = await bridge("runtimeSendMessage", { type: "TIS_FETCH_TRADE_DETAILS", tradeId: id }, 15000);
+        if (response?.ok && response.trade) return normalizeTradeDetail(response.trade, summary);
+      } catch {}
+    }
+
+    // Brave can block Roblox authentication cookies in extension workers even
+    // while first-party page requests work.  A selected trade is one explicit
+    // request, so use that first-party path rather than leave Roblox's native
+    // detail spinner permanently unresolved.
+    const fetchFirstParty = window.TIS_FETCH_TRADE_DETAIL_FIRST_PARTY;
+    if (typeof fetchFirstParty !== "function") throw new Error("first-party trade queue unavailable");
+    const detail = normalizeTradeDetail(await fetchFirstParty(id, true), summary);
+    if (typeof bridge === "function" && detail) {
+      bridge("runtimeSendMessage", { type: "TIS_STORE_TRADE_DETAILS", tradeId: id, trade: detail }, 10000).catch(() => {});
+    }
+    return detail;
+  }
+
+  function installCachedDetailSelector(scope) {
+    if (!scope || scope.__tisCachedDetailSelectorInstalled || typeof scope.selectTrade !== "function") return;
+    const nativeSelectTrade = scope.selectTrade;
+    scope.__tisCachedDetailSelectorInstalled = true;
+
+    scope.selectTrade = function tisSelectCachedTrade(trade) {
+      if (!trade?.id) return nativeSelectTrade.apply(this, arguments);
+      runInScope(scope, () => {
+        if (scope.data) scope.data.trade = trade;
+      });
+
+      fetchSelectedTradeDetail(trade.id, trade)
+        .then((detail) => {
+          runInScope(scope, () => {
+            if (String(scope.data?.trade?.id || "") === String(trade.id)) {
+              scope.data.trade = detail;
+            }
+          });
+          setTimeout(hydrateVisibleTradeThumbnails, 150);
+        })
+        .catch(() => {
+          // Keep this selected summary in place and retry through the
+          // prioritized queue. Falling back to Roblox here is what leaves its
+          // spinner permanently stuck after a rate-limited request.
+          setTimeout(() => {
+            if (String(scope.data?.trade?.id || "") === String(trade.id)) {
+              scope.selectTrade(trade);
+            }
+          }, 3000);
+        });
+    };
+  }
+
+  function normalizeCachedTradePage(payload, status) {
+    const summaries = (Array.isArray(payload?.data) ? payload.data : [])
+      .map((trade) => normalizeTradeSummary(trade, status))
+      .filter(Boolean);
+    if (summaries.some((trade) => !tradeMatchesStatus(trade, status))) {
+      throw new Error(`cached ${status} page contains a different trade status`);
+    }
+    summaries.nextPageCursor = payload?.nextPageCursor ?? null;
+    return summaries;
+  }
+
+  function getCachedTradePage(status, cursor = "") {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function") return Promise.reject(new Error("trade cache bridge unavailable"));
+
+    return bridge("runtimeSendMessage", {
+      type: "TIS_GET_TRADE_PAGE_CACHE",
+      status,
+      cursor,
+      limit: 25,
+      sortOrder: "Desc",
+    }, 15000).then((response) => {
+      if (!response?.ok || !response.cached || !Array.isArray(response.payload?.data)) {
+        throw new Error(response?.error || "trade page is not cached");
+      }
+      const summaries = normalizeCachedTradePage(response.payload, status);
+      // An empty cached root page can be a partial/old failure response. Only
+      // a fresh revalidation is allowed to establish a genuine no-results UI.
+      if (!cursor && !summaries.length) throw new Error(`empty cached ${status} root page`);
+      return summaries;
+    });
+  }
+
+  function getTradePageSignature(trades) {
+    return (Array.isArray(trades) ? trades : []).map((trade) => String(trade?.id || "")).join(",");
+  }
+
+  function reconcileTradeListOrder(scope, status) {
+    const current = Array.isArray(scope.data?.trades) ? scope.data.trades : [];
+    if (current.length < 2) return false;
+
+    // A native first page can arrive after the cached fallback was rendered.
+    // Roblox appends that response, yielding old rows followed by new rows.
+    // Preserve the server's intended descending-created order and remove
+    // overlap without changing any row rendering or pagination UI.
+    const unique = [];
+    const seen = new Set();
+    current.forEach((trade, index) => {
+      const id = String(trade?.id || "");
+      const key = id || `index:${index}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      unique.push({ trade, index });
+    });
+    unique.sort((left, right) => {
+      const leftTime = Date.parse(left.trade?.created || "") || 0;
+      const rightTime = Date.parse(right.trade?.created || "") || 0;
+      return rightTime - leftTime || left.index - right.index;
+    });
+    const reconciled = unique.map(({ trade }) => trade);
+    if (getTradePageSignature(current) === getTradePageSignature(reconciled)) return false;
+
+    runInScope(scope, () => {
+      if (normalizeStatus(scope.layout?.selectedTab?.value) === status) {
+        scope.data.trades = reconciled;
+      }
+    });
+    return true;
+  }
+
+  function tradeMatchesStatus(trade, status) {
+    const tradeStatus = normalizeStatus(trade?.tradeStatusType);
+    return !tradeStatus || tradeStatus === status;
+  }
+
+  function revalidateTradePage(status, force = false, cursor = "") {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function") return Promise.reject(new Error("trade cache bridge unavailable"));
+
+    const fetchFirstParty = () => {
+      const normalizedCursor = String(cursor || "");
+      const requestKey = `${status}:${normalizedCursor}`;
+      const existing = firstPartyTradePageRequests.get(requestKey);
+      if (existing) return existing;
+
+      const request = (async () => {
+        let lastError = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const url =
+              `https://trades.roblox.com/v1/trades/${status}` +
+              `?cursor=${encodeURIComponent(normalizedCursor)}` +
+              "&limit=25&sortOrder=Desc";
+            const response = await fetch(url, {
+              method: "GET",
+              credentials: "include",
+              headers: { accept: "application/json" },
+              cache: "no-store",
+            });
+            if (response.ok) {
+              const payload = await response.json();
+              const summaries = normalizeCachedTradePage(payload, status);
+              bridge("runtimeSendMessage", {
+                type: "TIS_STORE_TRADE_PAGE_CACHE",
+                status,
+                cursor: normalizedCursor,
+                limit: 25,
+                sortOrder: "Desc",
+                payload,
+              }, 10000).catch(() => {});
+              return summaries;
+            }
+            lastError = new Error(`trade page http ${response.status}`);
+            if (response.status !== 429) throw lastError;
+          } catch (error) {
+            lastError = error;
+            if (!/429/.test(String(error?.message || error))) throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+        throw lastError || new Error("trade page unavailable");
+      })().finally(() => firstPartyTradePageRequests.delete(requestKey));
+      firstPartyTradePageRequests.set(requestKey, request);
+      return request;
+    };
+
+    // In the normal Brave profile the page has Roblox's authenticated
+    // session while the service worker may not. A fresh page visit must use
+    // this one first-party revalidation so old cached outbounds cannot hide
+    // newly sent trades.
+    if (force) return fetchFirstParty();
+
+    return bridge("runtimeSendMessage", {
+      type: "TIS_REVALIDATE_TRADE_PAGE",
+      status,
+      cursor,
+      limit: 25,
+      sortOrder: "Desc",
+      force,
+    }, 15000).then((response) => {
+      if (!response?.ok || !Array.isArray(response.payload?.data)) {
+        throw new Error(response?.error || "trade page revalidation failed");
+      }
+      return normalizeCachedTradePage(response.payload, status);
+    }).catch(() => fetchFirstParty());
+  }
+
+  function renderCachedTradePage(scope, status, summaries) {
+    if (!Array.isArray(summaries)) throw new Error("cached trade page is invalid");
+    if (summaries.some((trade) => !tradeMatchesStatus(trade, status))) {
+      throw new Error(`refusing to render non-${status} trades on this page`);
+    }
+    runInScope(scope, () => {
+      if (normalizeStatus(scope.layout?.selectedTab?.value) !== status) return;
+      scope.data.trades = summaries;
+      scope.data.trade = null;
+      scope.data.tradesList.loading = false;
+      scope.data.tradesList.noResults = summaries.length === 0;
+      scope.__tisCachedPageSignature = getTradePageSignature(summaries);
+      scope.__tisCachedNextPageCursor = summaries.nextPageCursor ?? null;
+    });
+    window.postMessage({
+      type: "TIS_TRADES_LIST_DATA",
+      status,
+      payload: { data: summaries, nextPageCursor: summaries.nextPageCursor ?? null, previousPageCursor: null },
+    }, "*");
+
+    // Native Roblox selects the first row after a list is loaded. Do the same
+    // after Angular applies the cached rows so the trade pane (and its item
+    // thumbnails) is ready without requiring a manual click.
+    const firstTrade = summaries[0];
+    if (firstTrade) {
+      setTimeout(() => {
+        if (normalizeStatus(scope.layout?.selectedTab?.value) !== status) return;
+        if (scope.data?.trade || typeof scope.selectTrade !== "function") return;
+        scope.selectTrade(firstTrade);
+        setTimeout(hydrateVisibleTradeThumbnails, 300);
+      }, 0);
+    }
+  }
+
+  function appendCachedTradePage(scope, status, summaries) {
+    if (!Array.isArray(summaries) || summaries.some((trade) => !tradeMatchesStatus(trade, status))) {
+      throw new Error(`refusing to append non-${status} trades`);
+    }
+    const current = Array.isArray(scope.data?.trades) ? scope.data.trades : [];
+    const seen = new Set(current.map((trade) => String(trade?.id || "")));
+    const additions = summaries.filter((trade) => !seen.has(String(trade?.id || "")));
+    const payload = {
+      data: summaries,
+      nextPageCursor: summaries.nextPageCursor ?? null,
+      previousPageCursor: "tis-cache",
+    };
+    runInScope(scope, () => {
+      if (normalizeStatus(scope.layout?.selectedTab?.value) !== status) return;
+      scope.data.trades = [...current, ...additions];
+      scope.data.tradesList.loading = false;
+      scope.__tisCachedNextPageCursor = summaries.nextPageCursor ?? null;
+
+      // ng-repeat creates the added rows during this digest.  Announce the
+      // page after that point as well, otherwise a rapid scroll can coalesce
+      // the renderer before the later rows exist in the DOM.
+      scope.$$postDigest?.(() => {
+        window.postMessage({ type: "TIS_TRADES_LIST_DATA", status, payload }, "*");
+        setTimeout(() => {
+          window.postMessage({ type: "TIS_TRADES_LIST_DATA", status, payload }, "*");
+        }, 120);
+      });
+    });
+    window.postMessage({
+      type: "TIS_TRADES_LIST_DATA",
+      status,
+      // The enhancement pipeline merges pages only when this is non-null.
+      payload,
+    }, "*");
+    return additions.length;
+  }
+
+  function persistVisibleTradeData(scope) {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    const status = normalizeStatus(scope.layout?.selectedTab?.value);
+    const trades = Array.isArray(scope.data?.trades) ? scope.data.trades : [];
+    if (typeof bridge !== "function" || !status || !trades.length) return;
+    // Angular changes the selected tab before its next list arrives. Never
+    // write those old rows under the new category while that transition is in
+    // progress.
+    if (trades.some((trade) => !tradeMatchesStatus(trade, status))) return;
+
+    // Roblox may successfully populate Angular's list without issuing a
+    // request we can observe.  Feed that authoritative in-page data into the
+    // enhancement renderer once per distinct list, so row values do not rely
+    // on a second summary request or on a fragile fetch/XHR wrapper.
+    const visiblePayloadKey = `${status}:${getTradePageSignature(trades)}`;
+    const renderedValueCount = document.querySelectorAll(".trade-row-container .tis-trade-row-values").length;
+    const missingVisibleValues = renderedValueCount < trades.length;
+    const lastPayloadAt = visibleListPayloadAt.get(status) || 0;
+    if (
+      visibleListPayloadKeys.get(status) !== visiblePayloadKey ||
+      (missingVisibleValues && Date.now() - lastPayloadAt >= 1500)
+    ) {
+      visibleListPayloadKeys.set(status, visiblePayloadKey);
+      visibleListPayloadAt.set(status, Date.now());
+      window.postMessage({
+        type: "TIS_TRADES_LIST_DATA",
+        status,
+        payload: {
+          data: trades,
+          nextPageCursor: scope.__tisCachedNextPageCursor ?? null,
+          previousPageCursor: null,
+        },
+      }, "*");
+    }
+
+    const rootPageTrades = trades.length <= 25 ? trades : null;
+    const pageKey = rootPageTrades
+      ? `${status}:${rootPageTrades.map((trade) => String(trade?.id || "")).join(",")}`
+      : "";
+    // Cached rows are already persisted. Do not refresh their timestamp just
+    // because the page was re-opened; that would prevent revalidation.
+    if (rootPageTrades && visibleListCacheKeys.get(status) !== pageKey && scope.__tisCachedPageSignature !== getTradePageSignature(rootPageTrades)) {
+      visibleListCacheKeys.set(status, pageKey);
+      bridge("runtimeSendMessage", {
+        type: "TIS_STORE_TRADE_PAGE_CACHE",
+        status,
+        cursor: "",
+        limit: 25,
+        sortOrder: "Desc",
+        payload: { data: rootPageTrades, nextPageCursor: null, previousPageCursor: null },
+      }, 10000).catch(() => {});
+    }
+
+    const detail = scope.data?.trade;
+    const detailId = String(detail?.id || detail?.tradeId || "");
+    if (/^\d+$/.test(detailId) && (Array.isArray(detail?.offers) || detail?.participantAOffer || detail?.participantBOffer)) {
+      bridge("runtimeSendMessage", {
+        type: "TIS_STORE_TRADE_DETAILS",
+        tradeId: detailId,
+        trade: detail,
+      }, 10000).catch(() => {});
+    }
+
+    setTimeout(hydrateVisibleTradeThumbnails, 100);
+    setTimeout(hydrateVisibleTradeAvatars, 100);
+  }
+
+  function hydrateVisibleTradeAvatars() {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function" || !window.angular?.element) return;
+
+    const avatarsByRequestId = new Map();
+    document.querySelectorAll(".trade-row thumbnail-2d.avatar-card-image").forEach((avatar) => {
+      let targetId = "";
+      try {
+        targetId = String(window.angular.element(avatar).isolateScope?.()?.$ctrl?.thumbnailTargetId || "");
+      } catch {}
+      if (!/^\d+$/.test(targetId)) return;
+      const requestId = `AvatarHeadshot:${targetId}`;
+      const avatars = avatarsByRequestId.get(requestId) || [];
+      avatars.push(avatar);
+      avatarsByRequestId.set(requestId, avatars);
+    });
+
+    const requests = [...avatarsByRequestId.keys()].map((requestId) => ({
+      requestId,
+      targetId: requestId.split(":")[1],
+      type: "AvatarHeadshot",
+      size: "150x150",
+      format: "Webp",
+      isCircular: false,
+    }));
+    const signature = requests.map((request) => request.requestId).sort().join(",");
+    const needsImages = [...avatarsByRequestId.values()].some((avatars) => avatars.some((avatar) => {
+      const image = avatar.querySelector(":scope > img.tis-cached-avatar-image");
+      return !image || !image.complete || image.naturalWidth === 0;
+    }));
+    if (!signature || (signature === visibleAvatarSignature && !needsImages)) return;
+    visibleAvatarSignature = signature;
+
+    bridge("runtimeSendMessage", {
+      type: "TIS_FETCH_ROBLOX_ASSET_THUMBNAILS",
+      thumbnailRequests: requests,
+    }, 15000).then((response) => {
+      if (!response?.ok || !response.thumbnails) return;
+      avatarsByRequestId.forEach((avatars, requestId) => {
+        const url = String(response.thumbnails[requestId] || "");
+        if (!url) return;
+        avatars.forEach((avatar) => {
+          avatar.classList.add("tis-cached-avatar");
+          let image = avatar.querySelector(":scope > img.tis-cached-avatar-image");
+          if (!image) {
+            image = document.createElement("img");
+            image.className = "tis-cached-avatar-image";
+            image.alt = "";
+            image.decoding = "async";
+            image.loading = "eager";
+            image.addEventListener("error", () => { visibleAvatarSignature = ""; }, { once: true });
+            avatar.appendChild(image);
+          }
+          if (image.src !== url) image.src = url;
+        });
+      });
+    }).catch(() => {
+      visibleAvatarSignature = "";
+    });
+  }
+
+  function hydrateVisibleTradeThumbnails() {
+    const bridge = window.TIS_GENERIC?.bridgeRequest;
+    if (typeof bridge !== "function") return;
+
+    const cardsByRequestId = new Map();
+    document.querySelectorAll(".trade-item-card .item-card-thumb-container").forEach((thumb) => {
+      const host = thumb.querySelector(".thumbnail-2d-container[thumbnail-target-id]");
+      const targetId = String(host?.getAttribute("thumbnail-target-id") || "");
+      if (!/^\d+$/.test(targetId)) return;
+      const type = String(host.getAttribute("thumbnail-type") || "").toLowerCase().includes("bundle")
+        ? "BundleThumbnail"
+        : "Asset";
+      const requestId = `${type}:${targetId}`;
+      const cards = cardsByRequestId.get(requestId) || [];
+      cards.push(thumb);
+      cardsByRequestId.set(requestId, cards);
+    });
+
+    const requests = [...cardsByRequestId.keys()].map((requestId) => {
+      const [type, targetId] = requestId.split(":");
+      return { requestId, type, targetId, size: "150x150", format: "Webp", isCircular: false };
+    });
+    const signature = requests.map((request) => request.requestId).sort().join(",");
+    const needsImages = [...cardsByRequestId.values()].some((thumbs) => thumbs.some((thumb) => {
+      const image = thumb.querySelector(":scope > img.tis-thumb-memory-img");
+      return !image || !image.complete || image.naturalWidth === 0;
+    }));
+    if (!signature || (signature === visibleThumbnailSignature && !needsImages)) return;
+    visibleThumbnailSignature = signature;
+
+    bridge("runtimeSendMessage", {
+      type: "TIS_FETCH_ROBLOX_ASSET_THUMBNAILS",
+      thumbnailRequests: requests,
+    }, 15000).then((response) => {
+      if (!response?.ok || !response.thumbnails) return;
+      cardsByRequestId.forEach((thumbs, requestId) => {
+        const url = String(response.thumbnails[requestId] || "");
+        if (!url) return;
+        thumbs.forEach((thumb) => {
+          thumb.classList.add("tis-thumb-memory-thumb", "tis-thumb-memory-ready");
+          let image = thumb.querySelector(":scope > img.tis-thumb-memory-img");
+          if (!image) {
+            image = document.createElement("img");
+            image.className = "tis-thumb-memory-img";
+            image.alt = "";
+            image.decoding = "async";
+            image.loading = "eager";
+            image.addEventListener("error", () => { visibleThumbnailSignature = ""; }, { once: true });
+            thumb.appendChild(image);
+          }
+          if (image.src !== url) image.src = url;
+        });
+      });
+    }).catch(() => {
+      visibleThumbnailSignature = "";
+    });
+  }
+
+  function installCachedListLoader(scope) {
+    if (!scope || scope.__tisCachedListLoaderInstalled || typeof scope.selectTab !== "function") return;
+    const nativeSelectTab = scope.selectTab;
+    const nativeGetNextPage = scope.getNextPage;
+    scope.__tisCachedListLoaderInstalled = true;
+
+    scope.selectTab = function tisSelectCachedTradeTab(tab) {
+      const status = normalizeStatus(tab?.value);
+      // Inbound is the one category whose membership can change, so keep its
+      // native refresh path. Every other tab is immutable once received.
+      if (!status || status === "inbound" || typeof window.TIS_GENERIC?.bridgeRequest !== "function") {
+        return nativeSelectTab.apply(this, arguments);
+      }
+
+      runInScope(scope, () => {
+        scope.layout.selectedTab = tab;
+        scope.data.tradesList.loading = true;
+        scope.data.trades = [];
+        scope.data.trade = null;
+      });
+      try {
+        const root = document.querySelector('[ng-controller="tradesListController"]');
+        const injector = window.angular?.element(root).injector?.() || window.angular?.element(document.body).injector?.();
+        const state = injector?.get?.("$state");
+        state?.go?.(state.current?.name, { ...state.params, tab: tab.value }, { notify: false, location: true });
+      } catch {}
+      getCachedTradePage(status)
+        .then((summaries) => {
+          renderCachedTradePage(scope, status, summaries);
+          revalidateCurrentTradePage(scope, status, true);
+        })
+        .catch(() => revalidateTradePage(status, true)
+          .then((summaries) => renderCachedTradePage(scope, status, summaries))
+          .catch(() => nativeSelectTab.call(scope, tab)));
+    };
+
+    if (typeof nativeGetNextPage === "function") {
+      scope.getNextPage = function tisLoadCachedNextTradePage() {
+        const status = normalizeStatus(scope.layout?.selectedTab?.value);
+        const cursor = String(scope.__tisCachedNextPageCursor || "");
+        if (!status || !cursor || typeof window.TIS_GENERIC?.bridgeRequest !== "function") {
+          return nativeGetNextPage.apply(this, arguments);
+        }
+        if (scope.data?.tradesList?.loading) return;
+        // Lock synchronously: scroll events can arrive several times before
+        // Angular runs the queued $applyAsync callback.
+        scope.data.tradesList.loading = true;
+        const loadCursor = (pageCursor, allowOneSkip = true) => {
+          const appendPage = (page) => {
+            const added = appendCachedTradePage(scope, status, page);
+            const nextCursor = String(page.nextPageCursor || "");
+            if (!added && nextCursor && nextCursor !== pageCursor && allowOneSkip) {
+              return loadCursor(nextCursor, false);
+            }
+            return added;
+          };
+
+          // A cursor identifies a historical page.  Show its stored rows
+          // immediately when available, then refresh that cache separately.
+          // Waiting on Roblox here is what made scrolling look frozen even
+          // though the extension already had the exact page to display.
+          return getCachedTradePage(status, pageCursor)
+            .then((page) => {
+              revalidateTradePage(status, true, pageCursor).catch(() => {});
+              return appendPage(page);
+            })
+            .catch(() => revalidateTradePage(status, true, pageCursor).then(appendPage));
+        };
+
+        loadCursor(cursor).catch(() => nativeGetNextPage.call(scope));
+      };
+    }
+  }
+
+  function revalidateCurrentTradePage(scope, status, force = false) {
+    const now = Date.now();
+    const lastStarted = lastRevalidationStartedAt.get(status) || 0;
+    if (!force && now - lastStarted < 20 * 1000) return;
+    lastRevalidationStartedAt.set(status, now);
+
+    revalidateTradePage(status, force).then((summaries) => {
+      if (normalizeStatus(scope.layout?.selectedTab?.value) !== status) return;
+      const current = Array.isArray(scope.data?.trades) ? scope.data.trades : [];
+      if (getTradePageSignature(current.slice(0, summaries.length)) !== getTradePageSignature(summaries)) {
+        renderCachedTradePage(scope, status, summaries);
+      } else if (current.length <= summaries.length) {
+        // This is the initial/root list only.  Once pagination has appended
+        // rows, the root page's cursor points back into data already on
+        // screen.  Replacing the continuation cursor with it caused the
+        // scroller to keep re-reading duplicate pages and eventually stick.
+        runInScope(scope, () => {
+          scope.__tisCachedNextPageCursor = summaries.nextPageCursor ?? null;
+        });
+      }
+    }).catch(() => {});
+  }
+
+  function recoverCachedTrades(scope) {
+    persistVisibleTradeData(scope);
+    installCachedDetailSelector(scope);
+    installCachedListLoader(scope);
+
+    const status = normalizeStatus(scope.layout?.selectedTab?.value);
+    const listState = scope.data?.tradesList;
+    const currentTrades = Array.isArray(scope.data?.trades) ? scope.data.trades : [];
+    if (status && reconcileTradeListOrder(scope, status)) return;
+    // Roblox sets noResults for some failed list loads as well as genuine
+    // empty categories.  An empty live array must still be allowed to fall
+    // through to cache recovery; otherwise a transient Roblox failure leaves
+    // the entire list blank even when we have the last known rows locally.
+    if (!status || !listState || currentTrades.length) {
+      if (status) {
+        nativeListLoadStartedAt.delete(status);
+        revalidateCurrentTradePage(scope, status);
+      }
+      return;
+    }
+
+    const now = Date.now();
+    const nativeStartedAt = nativeListLoadStartedAt.get(status) || now;
+    nativeListLoadStartedAt.set(status, nativeStartedAt);
+    // Always let Roblox's fresh root-page request settle before inserting
+    // cached rows. Rendering cache during that request makes the native
+    // response append its new page underneath stale rows.
+    if (!listState.noResults && now - nativeStartedAt < NATIVE_LIST_GRACE_MS) return;
+
+    // Roblox can mark a failed request as no-results. At that point, or once
+    // its normal request window has elapsed, cached rows are the fallback.
+    if (recoveryInFlight || (lastRecoveryAttempt === status && now - lastRecoveryAttemptAt < 5000)) return;
+    lastRecoveryAttempt = status;
+    lastRecoveryAttemptAt = now;
+
+    recoveryInFlight = getCachedTradePage(status)
+      .then((summaries) => renderCachedTradePage(scope, status, summaries))
+      .catch(() => revalidateTradePage(status, true).then((summaries) => renderCachedTradePage(scope, status, summaries)))
+      .finally(() => {
+        recoveryInFlight = null;
+      });
+  }
+
+  function checkCachedTrades() {
+    if (location.origin !== "https://www.roblox.com" || !/^\/trades\/?$/i.test(location.pathname)) return;
+    const scope = getTradesListScope();
+    if (!scope) return;
+    watchTradeCacheAccount(scope);
+    if (accountSyncInFlight) return;
+    const status = normalizeStatus(scope.layout?.selectedTab?.value);
+    if (status && !initialPageRevalidation.has(status)) {
+      initialPageRevalidation.add(status);
+      revalidateCurrentTradePage(scope, status, true);
+    }
+    recoverCachedTrades(scope);
+  }
+
+  setInterval(checkCachedTrades, 750);
 })();
 
 (() => {
@@ -130,6 +1227,7 @@
   if (window.__TIS_TRADES_LIST_VALUES__) return;
   window.__TIS_TRADES_LIST_VALUES__ = true;
   const shared = window.TIS_GENERIC || {};
+  const getReactTradeItem = shared.getReactTradeItem || (() => null);
   const getExtensionAssetUrl = shared.getExtensionAssetUrl || ((path) => String(path || ""));
   const upsertStyle = shared.upsertStyle || ((id, text) => {
     let style = document.getElementById(id);
@@ -203,6 +1301,16 @@
   function setClassPresence(el, className, shouldHaveClass) {
     if (!el || el.classList.contains(className) === shouldHaveClass) return;
     el.classList.toggle(className, shouldHaveClass);
+  }
+
+  function getTradeDetailIdFromUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      if (url.origin !== "https://trades.roblox.com") return null;
+      return url.pathname.match(/^\/v2\/trades\/(\d+)$/i)?.[1] || null;
+    } catch {
+      return null;
+    }
   }
 
   function getDebugNodeId(node) {
@@ -365,6 +1473,9 @@
 
   function getTradeItemDataFromElement(element) {
     if (!element) return null;
+
+    const reactItem = getReactTradeItem(element);
+    if (reactItem) return reactItem;
 
     const candidates = [
       element,
@@ -756,7 +1867,7 @@
   }
 
   function getActiveTradeDetailRoot() {
-    const roots = Array.from(document.querySelectorAll(".trades-list-detail > div[ng-if], .trades-list-detail > .ng-scope"));
+    const roots = Array.from(document.querySelectorAll(".trades-list-detail > div[ng-if], .trades-list-detail > .ng-scope, .trades-list-detail"));
     return roots.find((root) => isElementVisible(root) && root.querySelector(".trade-list-detail-offer")) || null;
   }
 
@@ -830,6 +1941,8 @@
   }
 
   function getRapFromOfferItem(item) {
+    const reactRap = Number(getTradeItemDataFromElement(item)?.recentAveragePrice);
+    if (Number.isFinite(reactRap) && reactRap >= 0) return reactRap;
     return parseNum(
       item.querySelector(".item-card-price .text-robux")?.textContent ||
       item.querySelector(".item-card-price")?.textContent ||
@@ -897,7 +2010,7 @@
 
   function computeOfferTotals(panel) {
     const items = panel.querySelectorAll(
-      ".trade-request-item[data-collectibleiteminstanceid], .item-card-container[data-collectibleiteminstanceid]"
+      ".trade-request-item:not(.blank-item), .item-card-container[data-collectibleiteminstanceid]"
     );
     let rap = getRobuxFromPanel(panel);
     let value = rap;
@@ -1128,8 +2241,10 @@
     });
     state.lastTradeRowRenderIdentity = null;
     state.pendingTradeRowRenderIdentity = null;
-    if (hasVisibleTradeRowCards()) renderTradeRowValuesNow(`trade-detail-${source}`);
-    else scheduleTradeRowValuesRender(`trade-detail-${source}`, 20);
+    // Details commonly arrive in a group.  Coalesce those updates instead of
+    // rescanning every row once per response; repeated full rescans were able
+    // to starve the later batches on a large list.
+    scheduleTradeRowValuesRender(`trade-detail-${source}`, hasVisibleTradeRowCards() ? 60 : 20);
     return true;
   }
 
@@ -1869,39 +2984,31 @@
 
   async function fetchTradeDetailWithBackground(tradeId) {
     debug("background trade detail fetch:start", tradeId);
-    let trade = null;
-    let cached = false;
-
+    let responseError = null;
     try {
       const resp = await bridgeRequest("runtimeSendMessage", { type: "TIS_FETCH_TRADE_DETAILS", tradeId });
-      if (resp?.ok) {
-        trade = normalizeTradeDetail(resp.trade);
-        cached = resp.cached === true;
+      const trade = resp?.ok ? normalizeTradeDetail(resp.trade) : null;
+      if (trade) {
+        debug("background trade detail fetch:done", tradeId, {
+          hasOffers: Array.isArray(trade?.offers),
+          offerCount: Array.isArray(trade?.offers) ? trade.offers.length : 0,
+          cached: resp.cached === true,
+        });
+        return trade;
       }
-    } catch {}
-
-    if (!trade) {
-      const res = await fetch(`https://trades.roblox.com/v2/trades/${tradeId}`, {
-        method: "GET",
-        credentials: "include",
-        headers: { accept: "application/json" },
-        cache: "no-store",
-      });
-
-      if (!res.ok) {
-        const txt = await res.text().catch(() => "");
-        throw new Error(`trade detail http ${res.status}: ${txt.slice(0, 200)}`);
-      }
-
-      trade = normalizeTradeDetail(await res.json());
+      responseError = new Error(resp?.error || "trade detail unavailable");
+    } catch (error) {
+      responseError = error;
     }
 
-    debug("background trade detail fetch:done", tradeId, {
-      hasOffers: Array.isArray(trade?.offers),
-      offerCount: Array.isArray(trade?.offers) ? trade.offers.length : 0,
-      cached,
-    });
-    return trade;
+    // Some Brave privacy configurations do not expose Roblox's authenticated
+    // cookies to extension service workers.  This main-world fallback is
+    // first-party, and queueTradeDetailFetch keeps it deliberately small.
+    const fetchFirstParty = window.TIS_FETCH_TRADE_DETAIL_FIRST_PARTY;
+    if (typeof fetchFirstParty !== "function") {
+      throw new Error(`first-party trade queue unavailable; worker: ${String(responseError?.message || responseError || "unavailable")}`);
+    }
+    return normalizeTradeDetail(await fetchFirstParty(tradeId));
   }
 
   function queueTradeDetailFetch(tradeId) {
@@ -1919,33 +3026,24 @@
     debug("queue trade detail fetch", id);
     state.tradeDetailRequests.set(id, {
       requestedAt: Date.now(),
-      backgroundStarted: false,
+      backgroundStarted: true,
     });
-    window.postMessage({ type: "TIS_REQUEST_TRADE_DETAILS", tradeId: id }, "*");
 
-    setTimeout(() => {
-      const requestState = state.tradeDetailRequests.get(id);
-      if (!requestState || requestState.backgroundStarted || state.tradeDetailCache.has(id)) return;
-
-      requestState.backgroundStarted = true;
-      state.tradeDetailRequests.set(id, requestState);
-
-      fetchTradeDetailWithBackground(id)
-        .then((trade) => {
-          storeTradeDetail(id, trade, "background");
-        })
-        .catch((err) => {
-          if (state.tradeDetailCache.has(id)) {
-            state.tradeDetailRequests.delete(id);
-            return;
-          }
-
+    fetchTradeDetailWithBackground(id)
+      .then((trade) => {
+        storeTradeDetail(id, trade, "background");
+      })
+      .catch((err) => {
+        if (state.tradeDetailCache.has(id)) {
           state.tradeDetailRequests.delete(id);
-          state.tradeDetailFailedAt.set(id, Date.now());
-          debug("background trade detail fetch failed", id, String(err?.message || err));
-          scheduleTradeRowValuesRender("trade-detail-background-failed", 900);
-        });
-    }, 300);
+          return;
+        }
+
+        state.tradeDetailRequests.delete(id);
+        state.tradeDetailFailedAt.set(id, Date.now());
+        debug("background trade detail fetch failed", id, String(err?.message || err));
+        scheduleTradeRowValuesRender("trade-detail-background-failed", 900);
+      });
 
     return true;
   }
@@ -2055,6 +3153,10 @@
     const missingIds = [];
     let waitingCount = 0;
     const bindings = [];
+    // Keep a long trade list from turning into an unbounded detail-request
+    // burst.  Each finished batch schedules the next one, while cached
+    // details still resolve immediately.
+    const maxNewRequests = 6;
 
     contexts.forEach((context) => {
       const summaryTrade = resolveSummaryTradeForContext(context, summaries, summaryMap);
@@ -2070,6 +3172,7 @@
         detailCached: Boolean(resolvedTradeId && state.tradeDetailCache.has(resolvedTradeId)),
       });
       if (!resolvedTradeId || state.tradeDetailCache.has(resolvedTradeId)) return;
+      if (missingIds.length >= maxNewRequests) return;
       missingIds.push(resolvedTradeId);
       if (queueTradeDetailFetch(resolvedTradeId)) waitingCount++;
     });
@@ -2484,7 +3587,7 @@
       return {
         anchor: tradeButtons.querySelector("button") || tradeButtons,
         position: "beforebegin",
-        scope: tradeButtons.parentElement,
+        scope: tradeButtons,
         variant: "detail",
       };
     }
@@ -2513,14 +3616,29 @@
       return;
     }
 
-    let row = findDirectChildByClass(target.scope, "tis-trade-delta");
+    // insertAdjacentElement(beforebegin/afterend) makes the delta a sibling of
+    // the anchor. Always look in that actual parent; using an assumed scope
+    // caused every refresh to miss the previous row and append another one.
+    const expectedParent = target.anchor.parentElement;
+    if (!expectedParent) return;
+
+    const existingRows = Array.from(expectedParent.children)
+      .filter((element) => element.classList?.contains("tis-trade-delta"));
+    let row = existingRows.shift() || null;
+    existingRows.forEach((duplicate) => duplicate.remove());
+
+    // A trade detail is singular. Clean up stale rows left by React route
+    // swaps or by older builds before rendering the canonical row.
+    document.querySelectorAll(".tis-trade-delta").forEach((element) => {
+      if (element !== row) element.remove();
+    });
 
     if (!row) {
       row = document.createElement("div");
       row.className = "tis-trade-delta";
     }
 
-    if (row.parentElement !== target.scope) {
+    if (row.parentElement !== expectedParent) {
       target.anchor.insertAdjacentElement(target.position, row);
     }
 

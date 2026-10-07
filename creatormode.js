@@ -4,6 +4,7 @@
   window.__TIS_CREATOR_MODE__ = true;
 
   const shared = window.TIS_GENERIC || {};
+  const getReactTradeItem = shared.getReactTradeItem || (() => null);
   const buildTradeDeltaMarkup = shared.buildTradeDeltaMarkup || ((rapDiff, valueDiff) => {
     if (rapDiff === 0 && valueDiff === 0) {
       return {
@@ -126,6 +127,8 @@
 
   function getTradeItemDataFromElement(element) {
     if (!element) return null;
+    const reactItem = getReactTradeItem(element);
+    if (reactItem) return reactItem;
     const candidates = [
       element,
       element.querySelector?.(".item-card-thumb-container"),
@@ -194,6 +197,8 @@
   }
 
   function getRapFromItem(item) {
+    const reactRap = Number(getTradeItemDataFromElement(item)?.recentAveragePrice);
+    if (Number.isFinite(reactRap) && reactRap >= 0) return reactRap;
     return parseNum(
       item.querySelector(".item-card-price .text-robux")?.textContent ||
       item.querySelector(".item-card-price")?.textContent ||
@@ -662,7 +667,7 @@
       if (el.hasAttribute("title")) el.setAttribute("title", name);
     });
 
-    const nativePrice = item.querySelector(".item-card-price .text-robux, .item-value .text-robux");
+    const nativePrice = item.querySelector(".item-card-price .text-robux, .item-card-price .text-robux-tile, .item-value .text-robux");
     if (nativePrice && rap > 0) setText(nativePrice, fmt(rap));
 
     const roliValue = item.querySelector(".tis-roli-value");

@@ -6,6 +6,8 @@
   const bindLimitedInfoTooltip = shared.bindLimitedInfoTooltip || (() => null);
   const formatLimitedSerialBubble = shared.formatLimitedSerialBubble || (() => false);
   const bridgeRequest = shared.bridgeRequest || (async () => { throw new Error("bridge unavailable"); });
+  const getReactTradeItem = shared.getReactTradeItem || (() => null);
+  const getReactInventoryController = shared.getReactInventoryController || (() => null);
 
   if (window.__TIS_LOADED__) {
     window.dispatchEvent(new CustomEvent("TIS_ACTIVATE"));
@@ -14,6 +16,7 @@
   window.__TIS_LOADED__ = true;
 
   const PAGE_SIZE = 10;
+  const REACT_PAGE_SIZE = 12;
   const THUMBNAIL_PAGE_MEMORY_TTL_MS = 30 * 60 * 1000;
   const THUMBNAIL_MY_MEMORY_TTL_MS = 4 * 60 * 60 * 1000;
   const THUMBNAIL_MEMORY_MAX = 800;
@@ -28,6 +31,8 @@
     panelStateList: [],
     inventoryDataByOwnerId: new Map(),
     inventoryPromiseByOwnerId: new Map(),
+    nativeTradablePagesByOwnerId: new Map(),
+    tradableRateLimitUntilByUrl: new Map(),
     tradableItemsPageCache: new Map(),
     rolimonsPlayerByOwnerId: new Map(),
     rolimonsPlayerPromiseByOwnerId: new Map(),
@@ -56,6 +61,48 @@
     } catch {
       return null;
     }
+  }
+
+  function getTradableItemsRequestFromUrl(rawUrl) {
+    try {
+      const url = new URL(rawUrl, location.href);
+      if (url.origin !== "https://trades.roblox.com") return null;
+      const match = url.pathname.match(/^\/v2\/users\/([^/]+)\/tradableitems$/i);
+      if (!match) return null;
+      return {
+        ownerId: String(match[1] || ""),
+        cursor: String(url.searchParams.get("cursor") || ""),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function rememberNativeTradableItems(request, payload) {
+    if (!request || !payload || !Array.isArray(payload.items)) return;
+
+    const ownerId = String(payload.userId || request.ownerId || "");
+    if (!/^\d+$/.test(ownerId)) return;
+
+    let pages = cache.nativeTradablePagesByOwnerId.get(ownerId);
+    if (!pages) {
+      pages = new Map();
+      cache.nativeTradablePagesByOwnerId.set(ownerId, pages);
+    }
+    pages.set(String(request.cursor || ""), payload);
+  }
+
+  async function waitForNativeTradableItems(ownerId, cursor, timeoutMs = 1200) {
+    const key = String(ownerId || "");
+    const pageCursor = String(cursor || "");
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+
+    do {
+      const payload = cache.nativeTradablePagesByOwnerId.get(key)?.get(pageCursor);
+      if (payload) return payload;
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } while (true);
   }
 
   function emitTradesListPayload(status, payload) {
@@ -110,17 +157,42 @@
     if (window.__TIS_TRADES_LIST_TAP__) return;
     window.__TIS_TRADES_LIST_TAP__ = true;
 
+    // Roblox's current React bundle can retain fetch before content scripts
+    // replace window.fetch. Response.json remains shared, so observing it
+    // lets us reuse the inventory payload without issuing a duplicate request.
+    const originalResponseJson = Response.prototype.json;
+    Response.prototype.json = async function tisResponseJsonTap() {
+      const payload = await originalResponseJson.apply(this, arguments);
+      try {
+        const tradableRequest = getTradableItemsRequestFromUrl(this.url);
+        if (tradableRequest && this.ok) rememberNativeTradableItems(tradableRequest, payload);
+      } catch (err) {
+        debug("response json tap failed", String(err?.message || err));
+      }
+      return payload;
+    };
+
     const originalFetch = window.fetch;
     if (typeof originalFetch === "function") {
       window.fetch = async function tisFetchTap(input, init) {
         const response = await originalFetch.apply(this, arguments);
         try {
-          const url = typeof input === "string" ? input : input?.url;
+          const url = typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input?.url;
           const status = getTradesListStatusFromUrl(url);
+          const tradableRequest = getTradableItemsRequestFromUrl(url);
           if (status) {
             response.clone().json()
               .then((payload) => emitTradesListPayload(status, payload))
               .catch((err) => debug("trades list fetch clone failed", status, String(err?.message || err)));
+          }
+          if (tradableRequest && response.ok) {
+            response.clone().json()
+              .then((payload) => rememberNativeTradableItems(tradableRequest, payload))
+              .catch((err) => debug("tradable items fetch clone failed", String(err?.message || err)));
           }
         } catch (err) {
           debug("trades list fetch tap failed", String(err?.message || err));
@@ -139,14 +211,18 @@
 
     XMLHttpRequest.prototype.send = function tisXhrSend(body) {
       const status = getTradesListStatusFromUrl(this.__tisTradesListUrl);
-      if (status) {
+      const tradableRequest = getTradableItemsRequestFromUrl(this.__tisTradesListUrl);
+      if (status || tradableRequest) {
         this.addEventListener("loadend", function onTisTradesListLoadEnd() {
           try {
             if (this.readyState !== 4 || this.status < 200 || this.status >= 300) return;
-            const payload = JSON.parse(this.responseText || "null");
-            emitTradesListPayload(status, payload);
+            const payload = this.responseType === "json"
+              ? this.response
+              : JSON.parse(this.responseText || "null");
+            if (status) emitTradesListPayload(status, payload);
+            if (tradableRequest) rememberNativeTradableItems(tradableRequest, payload);
           } catch (err) {
-            debug("trades list xhr parse failed", status, String(err?.message || err));
+            debug("network tap xhr parse failed", status || "tradable-items", String(err?.message || err));
           }
         }, { once: true });
       }
@@ -156,6 +232,8 @@
 
     debug("trades list network tap installed");
   }
+
+  setupTradesListNetworkTap();
 
   function getMutationElement(node) {
     if (!node) return null;
@@ -182,7 +260,9 @@
       el.classList?.contains("tis-roli-offer-total") ||
       el.classList?.contains("tis-trade-delta") ||
       el.classList?.contains("tis-thumb-memory-img") ||
-      el.closest?.(".tis-controls, .tis-multi-dd, .tis-bag-of-holding-card, .tis-roli-row, .tis-roli-offer-total, .tis-trade-delta, .tis-thumb-memory-img")
+      el.classList?.contains("tis-react-item-cards") ||
+      el.classList?.contains("tis-react-inventory-card") ||
+      el.closest?.(".tis-controls, .tis-multi-dd, .tis-bag-of-holding-card, .tis-roli-row, .tis-roli-offer-total, .tis-trade-delta, .tis-thumb-memory-img, .tis-react-item-cards")
     );
   }
 
@@ -222,6 +302,17 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   // calls roblox's real click handler, but "impersonates" a real card click
 // by temporarily swapping scope.tradableItem to the instance you want.
 window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clickedEl) {
+  const reactPanel = clickedEl?.closest?.(".trade-inventory-panel") ||
+    document.querySelectorAll(".trade-inventory-panel")[tradableItem?.userId === getUserId() ? 0 : 1] ||
+    null;
+  const reactController = getReactInventoryController(reactPanel);
+  if (reactController?.onItemClick) {
+    if (reactController.isItemUnavailable?.(tradableItem) && !reactController.isItemInOffers?.(tradableItem)) {
+      return false;
+    }
+    return dispatchReactInventoryClick(reactPanel, tradableItem);
+  }
+
   if (!window.angular?.element) {
     console.warn("[tis] angular not available");
     return false;
@@ -452,34 +543,32 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
       background:transparent !important;
     }
 
-    /* these can sit above the item */
+    /* Roblox's unavailable container owns both the held overlay and selected check. */
+    .trade-item-card .item-card-thumb-container.tis-thumb-memory-thumb > .item-card-equipped{
+      position:absolute !important;
+      inset:0 !important;
+      z-index:30 !important;
+      pointer-events:none !important;
+    }
+    .trade-item-card .item-card-thumb-container.tis-thumb-memory-thumb > .item-card-equipped > .icon-check-selection{
+      position:relative !important;
+      z-index:31 !important;
+    }
+    .trade-item-card .item-card-thumb-container.tis-thumb-memory-thumb > .item-card-equipped > .item-card-holding{
+      position:relative !important;
+      z-index:31 !important;
+    }
+
+    /* These extension overlays can sit above the cached thumbnail too. */
     .item-card-thumb-container.tis-thumb-memory-thumb > .limited-icon-container,
     .item-card-thumb-container.tis-thumb-memory-thumb > .tis-multi-plus-float,
     .item-card-thumb-container.tis-thumb-memory-thumb > .tis-proj-icon{
       z-index:20 !important;
     }
 
-    /* selected/status overlays must render above the cached thumbnail layer. */
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="check" i],
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="select" i]{
-      position:absolute !important;
-      top:6px !important;
-      right:6px !important;
-      z-index:40 !important;
-      pointer-events:none;
-    }
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="hold" i],
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="unavailable" i]{
-      position:absolute !important;
-      inset:0 !important;
-      z-index:35 !important;
-      pointer-events:none;
-    }
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="restriction" i],
-    .item-card-thumb-container.tis-thumb-memory-thumb > [class*="status" i]{
-      position:absolute !important;
-      z-index:35 !important;
-      pointer-events:none;
+    /* The native load-failed message is wrong once our inventory replacement rendered. */
+    .trade-inventory-panel .container-empty[ng-show*="loadFailed"]{
+      display:none !important;
     }
 
     .tis-thumb-memory-original-hidden{
@@ -542,6 +631,30 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
     .trade-inventory-panel .item-card-thumb-container[ng-click*="root.onItemCardClick"] > .tis-proj-icon{
       position:absolute !important;
       z-index:20 !important;
+    }
+
+    .trade-inventory-panel > div .tis-react-item-cards{
+      min-height:0;
+    }
+    .tis-react-inventory-card .thumbnail-2d-container{
+      display:block;
+      position:relative;
+      width:100%;
+      height:100%;
+    }
+    .tis-react-inventory-card .tis-react-card-image{
+      display:block;
+      width:100%;
+      height:100%;
+      object-fit:contain;
+    }
+    .tis-react-inventory-card.tis-react-selected .item-card-thumb-container-inner{
+      outline:3px solid #00b06f;
+      outline-offset:-3px;
+      border-radius:8px;
+    }
+    .tis-react-inventory-card.tis-react-unavailable{
+      opacity:.55;
     }
   `;
   const mount = document.head || document.documentElement;
@@ -622,6 +735,11 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
     const key = String(url || "");
     const now = Date.now();
     const cached = cache.tradableItemsPageCache.get(key);
+    const rateLimitUntil = Number(cache.tradableRateLimitUntilByUrl.get(key) || 0);
+
+    if (rateLimitUntil > now) {
+      throw new Error(`tradable items cooldown until ${rateLimitUntil}`);
+    }
 
     if (cached?.data && (now - cached.at) < 30000) {
       return cached.data;
@@ -635,6 +753,9 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
       const res = await fetch(key, { credentials: "include" });
 
       if (!res.ok) {
+        if (res.status === 429) {
+          cache.tradableRateLimitUntilByUrl.set(key, Date.now() + 30000);
+        }
         const txt = await res.text().catch(() => "");
         throw new Error(`http ${res.status} from trades api: ${txt.slice(0, 200)}`);
       }
@@ -764,7 +885,17 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
     if (Array.isArray(askingAssets)) {
       askingAssets.forEach((asset) => {
         const isNft = asset?.nft === true || asset?.nft === 1 || asset?.nft === "1" || asset?.nft === "true";
-        if (!isNft) return;
+        // Rolimons also marks an item as not-for-trade by setting the asking
+        // value to its 404000 sentinel. This is a request value, not the
+        // item's Rolimons value, so it belongs with `nft` in this list.
+        const hasNotForTradeAskingValue = String(asset?.value ?? "") === "404000";
+        const tags = Array.isArray(asset?.tags)
+          ? asset.tags
+          : [asset?.tags, asset?.tag, asset?.tagId, asset?.tag_id];
+        const isNotForTradeTag = tags.some((tag) =>
+          [tag, tag?.id, tag?.value, tag?.tag].some((value) => String(value || "") === "404000")
+        );
+        if (!isNft && !hasNotForTradeAskingValue && !isNotForTradeTag) return;
         addNftAssetId(asset?.id ?? asset?.asset_id ?? asset?.assetId ?? asset?.item_id ?? asset?.itemId ?? asset?.itemid ?? asset?.item?.id);
       });
     }
@@ -1081,6 +1212,9 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
   if (!panel) return;
 
   panel.querySelectorAll(".inventory-type-dropdown").forEach((el) => el.remove());
+  panel.querySelectorAll(".inventory-filter-row").forEach((el) => {
+    if (!el.closest(".tis-controls")) el.style.display = "none";
+  });
 
   const btns = panel.querySelectorAll('button.input-dropdown-btn[data-toggle="dropdown"]');
   btns.forEach((btn) => {
@@ -1095,7 +1229,7 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
   }
 
   function getBagOfHoldingList(panel) {
-    return panel?.querySelector("ul.item-cards, ul.hlist.item-cards, .item-cards") || null;
+    return panel?.querySelector("ul.tis-react-item-cards, ul.item-cards, ul.hlist.item-cards, .item-cards") || null;
   }
 
   function getBagOfHoldingAnchor(panel) {
@@ -2328,6 +2462,9 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
   }
 
   function getInventoryPanelOwnerId(panel) {
+    const reactUserId = getReactInventoryController(panel)?.user?.id;
+    if (/^\d+$/.test(String(reactUserId || ""))) return Number(reactUserId);
+
     const scope = findAngularInventoryScope(panel);
     const candidates = [
       scope?.user?.id,
@@ -2376,9 +2513,10 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
       max: null,
       searchQuery: "",
       pageIndex: 0,
-      pageSize: PAGE_SIZE,
+      pageSize: getReactInventoryController(panel) ? REACT_PAGE_SIZE : PAGE_SIZE,
       all: null,
       loadingPromise: null,
+      nextFetchAttemptAt: 0,
       computed: [],
       bagComputed: [],
       nftComputed: [],
@@ -2846,10 +2984,334 @@ function computeList(panelState) {
     return getActiveComputed(panelState).slice(start, end);
   }
 
+  function getReactNativeInventoryList(panel) {
+    return Array.from(panel?.querySelectorAll?.("ul.item-cards") || [])
+      .find((list) => !list.classList.contains("tis-react-item-cards")) || null;
+  }
+
+  function getReactPagerParts(panel) {
+    const pager = panel?.querySelector?.(".trade-inventory-pager");
+    if (!pager) return { pager: null, previous: null, next: null, label: null };
+    return {
+      pager,
+      previous: pager.querySelector('button[aria-label="Back"]'),
+      next: pager.querySelector('button[aria-label="Next"]'),
+      label: pager.querySelector(".trade-inventory-pager-label"),
+    };
+  }
+
+  function syncReactSelections(panelState) {
+    const panel = getLivePanel(panelState) || panelState?.panel;
+    const controller = getReactInventoryController(panel);
+    if (!panelState?.all || !controller) return controller;
+
+    const selectedByKey = new Map();
+    for (const inst of panelState.all) {
+      let selected = false;
+      try { selected = Boolean(controller.isItemInOffers(inst)); } catch {}
+      if (!selected) continue;
+      const key = getGroupKeyForInst(inst);
+      let ids = selectedByKey.get(key);
+      if (!ids) {
+        ids = new Set();
+        selectedByKey.set(key, ids);
+      }
+      ids.add(String(inst.id || inst.collectibleItemInstanceId || ""));
+    }
+    panelState.selectedByKey = selectedByKey;
+    return controller;
+  }
+
+  function scheduleReactInventoryRefresh(panelState) {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const panel = getLivePanel(panelState);
+      if (!panel) return;
+      syncReactSelections(panelState);
+      applyToAngular(panel, panelState, { skipThumbnailWarmupHold: true });
+      publishOfferTotal();
+    }));
+  }
+
+  function dispatchReactInventoryClick(panel, inst) {
+    const controller = getReactInventoryController(panel);
+    if (!controller?.onItemClick || !inst) return false;
+
+    const nativeCard = getReactNativeInventoryList(panel)?.querySelector(".trade-inventory-card");
+    const propsKey = nativeCard && Object.keys(nativeCard).find((key) => key.startsWith("__reactProps$"));
+    const currentProps = propsKey ? nativeCard[propsKey] : null;
+    if (!nativeCard || !propsKey || typeof currentProps?.onClickCapture !== "function") {
+      controller.onItemClick(inst);
+      return true;
+    }
+
+    nativeCard[propsKey] = {
+      ...currentProps,
+      onClickCapture(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        controller.onItemClick(inst);
+      },
+    };
+    try {
+      const target = nativeCard.querySelector(".item-card-thumb-container") || nativeCard;
+      target.dispatchEvent(new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      }));
+    } finally {
+      nativeCard[propsKey] = currentProps;
+    }
+    return true;
+  }
+
+  function toggleReactInstance(panelState, inst, sourceElement) {
+    const panel = getLivePanel(panelState) || sourceElement?.closest?.(".trade-inventory-panel");
+    const controller = getReactInventoryController(panel);
+    if (!controller?.onItemClick || !inst || inst.__tisNotForTrade) return false;
+    let selected = false;
+    try { selected = Boolean(controller.isItemInOffers(inst)); } catch {}
+    if (!selected) {
+      try {
+        if (inst.isOnHold || controller.isItemUnavailable?.(inst)) return false;
+      } catch {}
+    }
+    dispatchReactInventoryClick(panel, inst);
+    scheduleReactInventoryRefresh(panelState);
+    return true;
+  }
+
+  function openReactMultiDropdown(panelState, group, button) {
+    if (!panelState || !group?.instances?.length || !button) return;
+    if (cache.openDD?.anchor === button) {
+      closeMultiDD();
+      return;
+    }
+    closeMultiDD();
+
+    const controller = syncReactSelections(panelState);
+    if (!controller) return;
+    const dd = document.createElement("div");
+    dd.className = "tis-multi-dd";
+    dd.addEventListener("mousedown", (event) => event.stopPropagation());
+
+    for (const inst of group.instances) {
+      const id = String(inst.id || inst.collectibleItemInstanceId || "");
+      const row = document.createElement("label");
+      row.className = "tis-multi-row";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.tisId = id;
+      try { checkbox.checked = Boolean(controller.isItemInOffers(inst)); } catch {}
+      const text = document.createElement("div");
+      const name = document.createElement("div");
+      name.textContent = String(inst.itemName || "item");
+      const code = document.createElement("code");
+      code.textContent = inst.serialNumber != null ? `#${inst.serialNumber} (${id})` : id;
+      text.append(name, code);
+      row.append(checkbox, text);
+      row.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleReactInstance(panelState, inst, button);
+        setTimeout(() => {
+          try { checkbox.checked = Boolean(getReactInventoryController(getLivePanel(panelState))?.isItemInOffers(inst)); } catch {}
+        }, 0);
+      });
+      dd.appendChild(row);
+    }
+
+    document.body.appendChild(dd);
+    const rect = button.getBoundingClientRect();
+    const pageWidth = Math.max(document.documentElement?.scrollWidth || 0, document.body?.scrollWidth || 0, window.innerWidth);
+    dd.style.left = `${Math.min(pageWidth - 260, Math.max(8, window.scrollX + rect.left))}px`;
+    dd.style.top = `${Math.max(8, window.scrollY + rect.bottom + 6)}px`;
+
+    const onDown = (event) => {
+      if (dd.contains(event.target) || button.contains(event.target)) return;
+      closeMultiDD();
+    };
+    cache.openDD = { el: dd, anchor: button, key: `${panelState.panelKey}:${group.key}`, onDown };
+    document.addEventListener("mousedown", onDown, true);
+  }
+
+  function createReactInventoryTemplate() {
+    const item = document.createElement("li");
+    item.className = "list-item item-card trade-item-card";
+    item.innerHTML = `
+      <div class="trade-inventory-card" role="button" tabindex="0" aria-pressed="false">
+        <div class="list-item item-card grid-item-container"><div class="item-card-container">
+          <a href="#" target="_self" class="item-card-link"><div class="item-card-link">
+            <div class="item-card-thumb-container"><div class="item-card-thumb-container-inner">
+              <span class="thumbnail-2d-container"></span>
+              <span class="limited-icon-container"><span class="icon-shop-limited"></span><span class="limited-hover-target" aria-hidden="true"></span></span>
+            </div></div>
+          </div><div class="item-card-caption">
+            <div class="item-card-name-link"><div class="item-card-name"></div></div>
+            <div class="text-overflow item-card-price font-header-2 text-subheader margin-top-none"><span class="icon-robux-16x16"></span><span class="text-robux-tile"></span></div>
+          </div></a>
+        </div></div>
+      </div>`;
+    return item;
+  }
+
+  function createReactInventoryCard(panelState, group, template) {
+    const item = (template || createReactInventoryTemplate()).cloneNode(true);
+    const rep = group?.rep || group?.instances?.[0];
+    if (!rep) return item;
+    const controller = getReactInventoryController(getLivePanel(panelState) || panelState.panel);
+    const instanceId = String(rep.id || rep.collectibleItemInstanceId || "");
+    const assetId = String(getAssetIdForGroup(group) || "");
+    const itemType = String(rep.itemTarget?.itemType || "Asset");
+
+    item.classList.add("tis-react-inventory-card");
+    item.dataset.tisKey = group.key;
+    item.dataset.tisPanelKey = panelState.panelKey;
+    item.dataset.collectibleiteminstanceid = instanceId;
+    const interactive = item.querySelector(".trade-inventory-card") || item;
+    const container = item.querySelector(".item-card-container");
+    if (container) container.dataset.collectibleiteminstanceid = instanceId;
+    const link = item.querySelector("a.item-card-link");
+    if (link && assetId) {
+      link.href = itemType.toLowerCase().includes("bundle")
+        ? `https://www.roblox.com/bundles/${assetId}`
+        : `https://www.roblox.com/catalog/${assetId}`;
+    }
+    const name = item.querySelector(".item-card-name");
+    if (name) {
+      name.textContent = String(rep.itemName || `Item ${assetId}`);
+      name.title = name.textContent;
+    }
+    const rap = item.querySelector(".text-robux-tile, .item-card-price .text-robux");
+    if (rap) rap.textContent = (Number(rep.recentAveragePrice) || 0).toLocaleString();
+
+    const thumbHost = item.querySelector(".thumbnail-2d-container");
+    const thumbUrl = getRememberedThumbnailUrlForRequest(getThumbnailRequestForGroup(group, panelState)) ||
+      getKnownThumbnailUrlForGroup(group);
+    if (thumbHost) {
+      thumbHost.classList.remove("shimmer", "icon-broken");
+      thumbHost.replaceChildren();
+      if (thumbUrl) {
+        const image = document.createElement("img");
+        image.className = "tis-react-card-image";
+        image.alt = String(rep.itemName || "");
+        image.decoding = "async";
+        image.src = thumbUrl;
+        thumbHost.appendChild(image);
+      }
+    }
+
+    let selected = false;
+    let unavailable = Boolean(rep.isOnHold || rep.__tisNotForTrade);
+    try {
+      selected = Boolean(controller?.isItemInOffers(rep));
+      unavailable = unavailable || Boolean(controller?.isItemUnavailable(rep) && !selected);
+    } catch {}
+    interactive.setAttribute("aria-pressed", String(selected));
+    interactive.setAttribute("aria-disabled", String(unavailable));
+    item.classList.toggle("tis-react-selected", selected);
+    item.classList.toggle("tis-react-unavailable", unavailable);
+    item.classList.toggle("tis-wishlist-match-card", isWishlistPriorityGroup(panelState, group));
+    syncWishlistNameDecoration(name, isWishlistPriorityGroup(panelState, group), String(rep.itemName || "wishlist match"));
+
+    const limited = item.querySelector(".limited-icon-container");
+    if (group.count > 1 && limited) {
+      limited.replaceChildren();
+      const countButton = document.createElement("button");
+      countButton.type = "button";
+      countButton.className = "tis-multi-btn";
+      countButton.textContent = panelState.viewMode === "bag" ? `x${group.count}` : `x${group.count} ▾`;
+      countButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (panelState.viewMode !== "bag") openReactMultiDropdown(panelState, group, countButton);
+      });
+      limited.appendChild(countButton);
+
+      if (panelState.viewMode === "main") {
+        const plus = document.createElement("button");
+        plus.type = "button";
+        plus.className = "tis-multi-plus tis-multi-plus-float";
+        plus.textContent = "+";
+        plus.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const liveController = syncReactSelections(panelState);
+          const available = group.instances.filter((inst) => {
+            try { return !inst.isOnHold && !liveController?.isItemInOffers(inst) && !liveController?.isItemUnavailable(inst); } catch { return !inst.isOnHold; }
+          });
+          const pick = available[Math.floor(Math.random() * available.length)];
+          if (pick) toggleReactInstance(panelState, pick, plus);
+        });
+        item.querySelector(".item-card-thumb-container")?.appendChild(plus);
+      }
+    } else if (limited) {
+      const serial = Number(rep.serialNumber);
+      if (Number.isFinite(serial) && serial > 0) {
+        limited.innerHTML = '<span class="limited-number-container"><span class="font-caption-header">#</span><span class="limited-number"></span></span>';
+        formatLimitedSerialBubble(limited, { serial });
+      }
+      const serialLine = getSerialTooltipLine(rep);
+      bindLimitedInfoTooltip(limited, {
+        enabled: Boolean(instanceId),
+        lines: serialLine ? [serialLine, instanceId] : [instanceId],
+        copyValue: instanceId,
+        copyLineIndex: serialLine ? 1 : 0,
+      });
+    }
+
+    const activate = (event) => {
+      if (event.target?.closest?.(".tis-multi-btn, .tis-multi-plus")) return;
+      event.preventDefault();
+      if (panelState.viewMode === "nft") return;
+      const liveController = syncReactSelections(panelState);
+      if (!liveController) return;
+      if (group.count > 1) {
+        const selectedInstances = group.instances.filter((inst) => {
+          try { return liveController.isItemInOffers(inst); } catch { return false; }
+        });
+        if (selectedInstances.length) selectedInstances.forEach((inst) => toggleReactInstance(panelState, inst, interactive));
+        else {
+          const available = group.instances.filter((inst) => {
+            try { return !inst.isOnHold && !liveController.isItemUnavailable(inst); } catch { return !inst.isOnHold; }
+          });
+          const pick = available[Math.floor(Math.random() * available.length)];
+          if (pick) toggleReactInstance(panelState, pick, interactive);
+        }
+      } else {
+        toggleReactInstance(panelState, rep, interactive);
+      }
+    };
+    interactive.addEventListener("click", activate, true);
+    interactive.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") activate(event);
+    }, true);
+    return item;
+  }
+
+  function renderReactInventory(panel, panelState, pageGroups) {
+    const nativeList = getReactNativeInventoryList(panel);
+    if (!nativeList) return false;
+    const template = nativeList.querySelector(":scope > li, :scope > .list-item") || createReactInventoryTemplate();
+    nativeList.style.display = "none";
+    nativeList.setAttribute("aria-hidden", "true");
+
+    let list = panel.querySelector("ul.tis-react-item-cards");
+    if (!list) {
+      list = document.createElement("ul");
+      list.className = `${nativeList.className} tis-react-item-cards`;
+      nativeList.insertAdjacentElement("afterend", list);
+    }
+    list.replaceChildren(...pageGroups.map((group) => createReactInventoryCard(panelState, group, template)));
+    syncInventoryLabel(panel, panelState);
+    return true;
+  }
+
 function applyToAngular(panel, panelState = getPanelState(panel), options = {}) {
   if (!panelState) return;
   const scope = findAngularInventoryScope(panel);
-  if (!scope) {
+  const reactController = getReactInventoryController(panel);
+  if (!scope && !reactController) {
     console.warn(`${TAG} couldnt find angular inventory scope yet`);
     return;
   }
@@ -2896,7 +3358,8 @@ function applyToAngular(panel, panelState = getPanelState(panel), options = {}) 
     pageGroups: pageGroups.length
   });
 
-  // angular expects tradableItem objects, so give it the representative instance
+  // Both renderers use stable representative clones so selecting one copy does
+  // not mutate the real collectible instance IDs kept in the group.
   const pageSlice = pageGroups.map(g => {
   // IMPORTANT: use a stable clone for display so we never mutate real instance ids
   if (!g.viewRep) g.viewRep = { ...g.rep };
@@ -2916,6 +3379,16 @@ function applyToAngular(panel, panelState = getPanelState(panel), options = {}) 
 
   return rep;
   });
+
+  if (reactController) {
+    renderReactInventory(panel, panelState, pageGroups);
+    updatePagerDisabled(panel, panelState);
+    updatePagerLabel(panel, panelState);
+    setTimeout(() => {
+      try { renderBagOfHoldingCard(panel, panelState); } catch {}
+    }, 0);
+    return;
+  }
 
 
   scope.$applyAsync(() => {
@@ -3273,6 +3746,9 @@ function decorateMultiCopyUI(panel, panelState = getPanelState(panel)) {
     if (!panelState) throw new Error("missing inventory panel state");
     if (panelState.all) return panelState.all;
     if (panelState.loadingPromise) return panelState.loadingPromise;
+    if (Date.now() < Number(panelState.nextFetchAttemptAt || 0)) {
+      throw new Error("tradable items request is cooling down");
+    }
 
     panelState.loadingPromise = (async () => {
       const uid = resolvePanelOwnerId(panelState) || getUserId();
@@ -3289,7 +3765,11 @@ function decorateMultiCopyUI(panel, panelState = getPanelState(panel)) {
           `?sortBy=CreationTime&cursor=${encodeURIComponent(cursor)}` +
           `&limit=50&sortOrder=Desc`;
 
-        const data = await fetchTradableItemsPage(url);
+        const nativePages = cache.nativeTradablePagesByOwnerId.get(String(uid));
+        const nativeData = nativePages?.get(cursor) || (
+          cursor === "" ? await waitForNativeTradableItems(uid, cursor) : null
+        );
+        const data = nativeData || await fetchTradableItemsPage(url);
 
         const items = Array.isArray(data.items) ? data.items : [];
         for (const it of items) {
@@ -3340,14 +3820,16 @@ function decorateMultiCopyUI(panel, panelState = getPanelState(panel)) {
         seen.add(next);
         cursor = next;
 
-        // tiny delay so we don't look like a bot (because roblox is twitchy)
-        await sleep(80);
+        // Roblox's React page already makes its own inventory requests. Give
+        // the endpoint room before following a cursor for the full sort view.
+        await sleep(2000);
       }
 
       hydratePanelStateFromAll(panelState, all);
       return panelState.all;
     })().catch(err => {
       panelState.loadingPromise = null;
+      panelState.nextFetchAttemptAt = Date.now() + (/429|cooldown/i.test(String(err?.message || err)) ? 30000 : 5000);
       console.error(`${TAG} failed fetching tradable items:`, err);
       throw err;
     });
@@ -3459,8 +3941,9 @@ function hookGlobalMultiCardClicks() {
 
 
   function hookPager(panel, panelState = getPanelState(panel)) {
-    const prevBtn = panel.querySelector(".pager-prev button");
-    const nextBtn = panel.querySelector(".pager-next button");
+    const reactPager = getReactPagerParts(panel);
+    const prevBtn = panel.querySelector(".pager-prev button") || reactPager.previous;
+    const nextBtn = panel.querySelector(".pager-next button") || reactPager.next;
 
     if (!panelState || !prevBtn || !nextBtn) return;
     if (prevBtn.__tisPagerHooked && nextBtn.__tisPagerHooked) return;
@@ -3491,8 +3974,9 @@ function hookGlobalMultiCardClicks() {
   }
 
   function updatePagerDisabled(panel, panelState = getPanelState(panel)) {
-    const prevBtn = panel.querySelector(".pager-prev button");
-    const nextBtn = panel.querySelector(".pager-next button");
+    const reactPager = getReactPagerParts(panel);
+    const prevBtn = panel.querySelector(".pager-prev button") || reactPager.previous;
+    const nextBtn = panel.querySelector(".pager-next button") || reactPager.next;
     if (!panelState || !prevBtn || !nextBtn) return;
 
     if (!isActive(panelState)) {
@@ -3630,12 +4114,13 @@ function hookGlobalMultiCardClicks() {
 
 function ensurePagerLabel(panel, panelState = getPanelState(panel)) {
   // find the pager container
-  const pager = panel.querySelector(".pager, .trade-pager, .inventory-pager");
+  const pager = panel.querySelector(".pager, .trade-pager, .inventory-pager, .trade-inventory-pager");
   if (!pager) return null;
 
   // this is the exact roblox "Page 1" span you pasted
   const robloxPageSpan =
     pager.querySelector("span[ng-bind*='Label.CurrentPage']") ||
+    pager.querySelector(".trade-inventory-pager-label") ||
     Array.from(pager.querySelectorAll("span.ng-binding")).find(el =>
       /^page\s+\d+/i.test((el.textContent || "").trim())
     );
@@ -3702,9 +4187,10 @@ function updatePagerLabel(panel, panelState = getPanelState(panel)) {
   }
 
   // inactive: roblox paging. mirror what their hidden span says (so it stays accurate)
-  const pager = panel.querySelector(".pager, .trade-pager, .inventory-pager");
+  const pager = panel.querySelector(".pager, .trade-pager, .inventory-pager, .trade-inventory-pager");
   const robloxPageSpan =
     pager?.querySelector("span[ng-bind*='Label.CurrentPage']") ||
+    pager?.querySelector(".trade-inventory-pager-label") ||
     Array.from(pager?.querySelectorAll("span.ng-binding") || []).find(el =>
       /^page\s+\d+/i.test((el.textContent || "").trim())
     );
@@ -3724,10 +4210,11 @@ function getOfferInstanceIdsFromDOM(panelState = null) {
   const offerRoot = getOfferRootForPanelState(panelState);
   if (!offerRoot) return new Set();
 
-  const nodes = offerRoot.querySelectorAll(".trade-request-item[data-collectibleiteminstanceid]");
+  const nodes = offerRoot.querySelectorAll(".trade-request-item:not(.blank-item), .item-card-container[data-collectibleiteminstanceid]");
   const ids = new Set();
   nodes.forEach(n => {
-    const v = n.getAttribute("data-collectibleiteminstanceid");
+    const item = getReactTradeItem(n);
+    const v = n.getAttribute("data-collectibleiteminstanceid") || item?.collectibleItemInstanceId || item?.id;
     if (v) ids.add(v);
   });
   return ids;
@@ -3760,7 +4247,11 @@ function reconcileSelectionsFromOfferDOM(panel, panelState = getPanelState(panel
     if (!offerIds.has(pickId)) panelState.autoPickByKey.delete(key);
   }
   // update overlays on currently rendered cards
-  try { decorateMultiCopyUI(panel, panelState); } catch {}
+  if (getReactInventoryController(panel)) {
+    try { applyToAngular(panel, panelState, { skipThumbnailWarmupHold: true }); } catch {}
+  } else {
+    try { decorateMultiCopyUI(panel, panelState); } catch {}
+  }
   publishOfferTotal();
 }
 
@@ -3871,7 +4362,11 @@ window.addEventListener("message", (ev) => {
         applyToAngular(panel, panelState);
       }
 
-      if (!panelState.all && !panelState.loadingPromise) {
+      if (
+        !panelState.all &&
+        !panelState.loadingPromise &&
+        Date.now() >= Number(panelState.nextFetchAttemptAt || 0)
+      ) {
         fetchAllTradableInstances(panelState)
           .then(async () => {
             const livePanel = getLivePanel(panelState);
@@ -3900,6 +4395,12 @@ window.addEventListener("message", (ev) => {
   function panelNeedsSetup(panel) {
     if (!panel) return false;
     const panelState = getPanelState(panel);
+    if (
+      panelState &&
+      !panelState.all &&
+      !panelState.loadingPromise &&
+      Date.now() >= Number(panelState.nextFetchAttemptAt || 0)
+    ) return true;
     if (!panel.querySelector(".tis-controls")) return true;
     if (panel.querySelector(".inventory-type-dropdown")) return true;
     if (!panel.querySelector(".tis-pager-label")) return true;

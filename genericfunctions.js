@@ -505,6 +505,86 @@
     });
   };
 
+  // Roblox's current trade UI is React-based. React keeps the item and
+  // inventory callbacks on the host node's fiber, so expose a small adapter
+  // instead of making every feature depend on minified component names.
+  const getReactFiber = (element) => {
+    if (!element) return null;
+    const key = Object.keys(element).find((name) => name.startsWith("__reactFiber$"));
+    return key ? element[key] : null;
+  };
+
+  const findReactFiber = (element, predicate, maxDepth = 30) => {
+    let fiber = getReactFiber(element);
+    for (let depth = 0; fiber && depth < maxDepth; depth += 1, fiber = fiber.return) {
+      try {
+        if (predicate(fiber, fiber.memoizedProps)) return fiber;
+      } catch {}
+    }
+    return null;
+  };
+
+  const looksLikeReactTradeItem = (value) => Boolean(
+    value &&
+    typeof value === "object" &&
+    (value.collectibleItemInstanceId || value.itemTarget?.targetId) &&
+    (value.id || value.collectibleItemInstanceId)
+  );
+
+  const getReactTradeItem = (element) => {
+    const candidates = [
+      element,
+      element?.closest?.(".trade-inventory-card, .trade-request-item, .item-card-container"),
+      element?.querySelector?.(".trade-inventory-card, .trade-request-item, .item-card-container"),
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      const fiber = findReactFiber(candidate, (_fiber, props) => {
+        if (!props || typeof props !== "object") return false;
+        return [
+          props.item,
+          props.tradableItem,
+          props.tradeItem,
+          props.offerItem,
+          props.slot?.tradableItem,
+          props.slot?.item,
+        ].some(looksLikeReactTradeItem);
+      });
+      const props = fiber?.memoizedProps;
+      if (!props) continue;
+      const item = [
+        props.item,
+        props.tradableItem,
+        props.tradeItem,
+        props.offerItem,
+        props.slot?.tradableItem,
+        props.slot?.item,
+      ].find(looksLikeReactTradeItem);
+      if (item) return item;
+    }
+    return null;
+  };
+
+  const getReactInventoryController = (panel) => {
+    const candidate = panel?.querySelector?.(".trade-inventory-card") || panel;
+    const fiber = findReactFiber(candidate, (_fiber, props) => Boolean(
+      props &&
+      typeof props.onItemClick === "function" &&
+      typeof props.isItemInOffers === "function"
+    ));
+    if (!fiber) return null;
+    const props = fiber.memoizedProps;
+    return {
+      fiber,
+      user: props.user || null,
+      onItemClick: props.onItemClick,
+      isItemInOffers: props.isItemInOffers,
+      isItemUnavailable: typeof props.isItemUnavailable === "function"
+        ? props.isItemUnavailable
+        : (() => false),
+    };
+  };
+
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     const msg = event?.data;
@@ -542,5 +622,9 @@
     bindLimitedInfoTooltip,
     buildTradeDeltaMarkup,
     bridgeRequest,
+    getReactFiber,
+    findReactFiber,
+    getReactTradeItem,
+    getReactInventoryController,
   };
 })();
