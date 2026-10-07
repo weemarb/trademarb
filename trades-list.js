@@ -2009,13 +2009,22 @@
   }
 
   function computeOfferTotals(panel) {
-    const items = panel.querySelectorAll(
-      ".trade-request-item:not(.blank-item), .item-card-container[data-collectibleiteminstanceid]"
+    const tradeItems = Array.from(
+      panel.querySelectorAll(".trade-request-item:not(.blank-item)")
     );
+    const items = tradeItems.length
+      ? tradeItems
+      : Array.from(panel.querySelectorAll(".item-card-container[data-collectibleiteminstanceid]"));
+
     let rap = getRobuxFromPanel(panel);
     let value = rap;
+    const seenInstanceIds = new Set();
 
     items.forEach((item) => {
+      const instanceId = getCollectibleItemInstanceIdFromOfferItem(item);
+      if (instanceId && seenInstanceIds.has(instanceId)) return;
+      if (instanceId) seenInstanceIds.add(instanceId);
+
       rap += getOfferRapFromItem(item);
       value += getOfferValueFromItem(item);
     });
@@ -3537,37 +3546,34 @@
     const detailRoot = getActiveTradeDetailRoot();
     const detailOffers = Array.from(detailRoot?.querySelectorAll(".trade-list-detail-offer") || []);
     const receiveOfferBlock = detailOffers[1] || null;
-    const receiveDivider = receiveOfferBlock?.querySelector(":scope > .rbx-divider");
-    if (receiveOfferBlock?.parentElement && receiveDivider) {
+    if (receiveOfferBlock?.parentElement) {
       return {
-        anchor: receiveDivider,
+        anchor: receiveOfferBlock,
         position: "beforebegin",
-        scope: receiveOfferBlock,
-        variant: "detail",
-      };
-    }
-
-    const receiveHeader = Array.from(detailRoot?.querySelectorAll(".trade-list-detail-offer-header") || [])
-      .find((el) => (el.textContent || "").trim().toLowerCase() === "items you will receive");
-    const receiveHeaderBlock = receiveHeader?.parentElement;
-    const receiveHeaderDivider = receiveHeaderBlock?.querySelector(":scope > .rbx-divider");
-    if (receiveHeaderBlock?.parentElement && receiveHeaderDivider) {
-      return {
-        anchor: receiveHeaderDivider,
-        position: "beforebegin",
-        scope: receiveHeaderBlock,
+        scope: receiveOfferBlock.parentElement,
         variant: "detail",
       };
     }
 
     const composerRoot = getActiveComposerRoot();
+    const composerOffers = Array.from(composerRoot?.querySelectorAll(".trade-request-window-offer") || []);
+    const requestOfferBlock = composerOffers[1] || null;
+    if (requestOfferBlock?.parentElement) {
+      return {
+        anchor: requestOfferBlock,
+        position: "beforebegin",
+        scope: requestOfferBlock.parentElement,
+        variant: "composer",
+      };
+    }
+
     const yourRequestHeader = Array.from(composerRoot?.querySelectorAll(".trade-request-window-offer > h2") || [])
       .find((el) => (el.textContent || "").trim().toLowerCase() === "your request");
-    if (yourRequestHeader?.parentElement) {
+    if (yourRequestHeader?.parentElement?.parentElement) {
       return {
-        anchor: yourRequestHeader,
+        anchor: yourRequestHeader.parentElement,
         position: "beforebegin",
-        scope: yourRequestHeader.parentElement,
+        scope: yourRequestHeader.parentElement.parentElement,
         variant: "composer",
       };
     }
@@ -3587,7 +3593,7 @@
       return {
         anchor: tradeButtons.querySelector("button") || tradeButtons,
         position: "beforebegin",
-        scope: tradeButtons,
+        scope: tradeButtons.parentElement,
         variant: "detail",
       };
     }
@@ -3915,7 +3921,9 @@
       scheduleOfferTotalsRefresh("dom-mutation");
     });
     mo.observe(document.documentElement, { childList: true, subtree: true });
-    observeInjectedRemovalDebug();
+    // This was a full-document debug observer left enabled in production.
+    // Keep the helper available for manual debugging, but don't pay for it on
+    // every DOM removal during normal trade-list use.
     observeOfferPanels();
     scheduleOfferTotalsRefresh("init");
     return true;
