@@ -1712,9 +1712,6 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
 
     const enqueueThumb = (thumb) => {
       if (!thumb || !thumb.isConnected) return;
-      const panel = thumb.closest?.(".trade-inventory-panel");
-      const panelState = getPanelState(panel);
-      if (panelState) syncThumbnailMemoryForThumb(thumb, panelState, null);
       queue.add(thumb);
       if (!microtaskQueued) {
         microtaskQueued = true;
@@ -3946,10 +3943,16 @@ window.addEventListener("message", (ev) => {
     scheduleInit("activate");
   });
 
-  // also run a few times early
+  // Retry during early Roblox boot, but stop as soon as the composer is actually
+  // present and fully wired. The old loop reran the whole setup 40 times even
+  // after success, which needlessly churned Angular/DOM work for ~10 seconds.
   (async () => {
     for (let i = 0; i < 40; i++) {
       await initOnceReady();
+
+      const panels = getInventoryPanels();
+      if (panels.length && !pageNeedsComposerRepair()) break;
+
       await sleep(250);
     }
   })();
