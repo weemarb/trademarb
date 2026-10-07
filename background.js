@@ -86,15 +86,18 @@ async function fetchJson(url) {
   return res.json();
 }
 
-async function fetchJsonWithRetry(url, attempts = 3) {
+async function fetchJsonWithRetry(url, attempts = 2) {
   let lastError = null;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       return await fetchJson(url);
     } catch (error) {
       lastError = error;
-      if (attempt + 1 >= attempts) break;
-      await sleep(200 * (attempt + 1));
+      const message = String(error?.message || error);
+      const status = Number(message.match(/http\s+(\d+)/i)?.[1] || 0);
+      const retryable = !status || status === 429 || status >= 500;
+      if (!retryable || attempt + 1 >= attempts) break;
+      await sleep((status === 429 ? 1800 : 600) * (attempt + 1));
     }
   }
   throw lastError || new Error(`failed to fetch ${url}`);
@@ -428,17 +431,17 @@ const tradeDetailCache = new Map();
 const tradeDetailFetchRequests = new Map();
 const tradeDetailFetchQueue = [];
 let activeTradeDetailFetches = 0;
-const MAX_CONCURRENT_TRADE_DETAIL_FETCHES = 8;
-const TRADE_DETAIL_CACHE_MS = 2 * 60 * 1000;
+const MAX_CONCURRENT_TRADE_DETAIL_FETCHES = 1;
+const TRADE_DETAIL_FETCH_GAP_MS = 500;
+const TRADE_DETAIL_CACHE_MS = 30 * 60 * 1000;
 const tradeSummaryCache = new Map();
-const TRADE_SUMMARY_CACHE_MS = 30 * 1000;
+const TRADE_SUMMARY_CACHE_MS = 5 * 60 * 1000;
 const TRADE_CACHE_STORAGE_PREFIX = "tis_trade_cache_v1:";
-const TRADE_CACHE_PAGE_LIMIT_PER_STATUS = 12;
-// There are twelve cached list pages per status (25 rows each).  Retain the
-// matching amount of immutable detail data so revisiting those rows does not
-// turn into another network burst.
-const TRADE_CACHE_DETAIL_LIMIT = 350;
-const TRADE_CACHE_REVALIDATE_MS = 20 * 1000;
+const TRADE_CACHE_PAGE_LIMIT_PER_STATUS = 24;
+// Keep enough historical pages/details that scrolling around old trades does
+// not repeatedly rediscover the same immutable offers from Roblox.
+const TRADE_CACHE_DETAIL_LIMIT = 1000;
+const TRADE_CACHE_REVALIDATE_MS = 5 * 60 * 1000;
 
 let tradeCacheUserId = null;
 let tradeCacheUserIdFetchedAt = 0;
@@ -474,23 +477,23 @@ function resetTradeRuntimeCachesForAccount(userId) {
 }
 
 function pumpTradeDetailFetchQueue() {
-  while (activeTradeDetailFetches < MAX_CONCURRENT_TRADE_DETAIL_FETCHES && tradeDetailFetchQueue.length) {
-    const next = tradeDetailFetchQueue.shift();
-    activeTradeDetailFetches += 1;
-    fetchJsonWithRetry(`https://trades.roblox.com/v2/trades/${next.tradeId}`)
-      .then((trade) => {
-        if (!trade || typeof trade !== "object") throw new Error("missing trade payload");
-        if (!Array.isArray(trade.offers)) {
-          trade.offers = [trade.participantAOffer, trade.participantBOffer].filter(Boolean);
-        }
-        next.resolve(trade);
-      })
-      .catch(next.reject)
-      .finally(() => {
-        activeTradeDetailFetches -= 1;
-        pumpTradeDetailFetchQueue();
-      });
-  }
+  if (activeTradeDetailFetches >= MAX_CONCURRENT_TRADE_DETAIL_FETCHES || !tradeDetailFetchQueue.length) return;
+
+  const next = tradeDetailFetchQueue.shift();
+  activeTradeDetailFetches += 1;
+  fetchJsonWithRetry(`https://trades.roblox.com/v2/trades/${next.tradeId}`)
+    .then((trade) => {
+      if (!trade || typeof trade !== "object") throw new Error("missing trade payload");
+      if (!Array.isArray(trade.offers)) {
+        trade.offers = [trade.participantAOffer, trade.participantBOffer].filter(Boolean);
+      }
+      next.resolve(trade);
+    })
+    .catch(next.reject)
+    .finally(() => {
+      activeTradeDetailFetches -= 1;
+      setTimeout(pumpTradeDetailFetchQueue, TRADE_DETAIL_FETCH_GAP_MS);
+    });
 }
 
 function fetchTradeDetailQueued(tradeId) {
@@ -514,7 +517,7 @@ function getTradePageKey(cursor, limit, sortOrder) {
 
 async function getTradeCacheUserId() {
   const now = Date.now();
-  if (tradeCacheUserId && (now - tradeCacheUserIdFetchedAt) < 5 * 60 * 1000) {
+  if (tradeCacheUserId && (now - tradeCacheUserIdFetchedAt) < 30 * 60 * 1000) {
     return tradeCacheUserId;
   }
 
