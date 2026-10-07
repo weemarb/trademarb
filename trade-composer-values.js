@@ -607,6 +607,19 @@
     return lines[lines.length - 1] || null;
   }
 
+  function getNativeRapTotal(panel) {
+    const totalLine = getNativeTotalLine(panel);
+    if (!totalLine) return 0;
+
+    return parseNum(
+      totalLine.querySelector(".robux-line-value")?.textContent ||
+      totalLine.querySelector(".text-robux-lg")?.textContent ||
+      totalLine.querySelector(".robux-line-amount")?.textContent ||
+      totalLine.textContent ||
+      "0"
+    );
+  }
+
   function renameNativeRapLabel(panel) {
     const totalLine = getNativeTotalLine(panel);
     const lead = totalLine?.querySelector(".text-lead");
@@ -758,10 +771,25 @@
   }
 
   function computeOfferTotals(panel) {
-    // Roblox can expose the same offer item through both the outer trade item
-    // and an inner card. Prefer the trade-item representation so one limited
-    // cannot be counted twice, then dedupe by collectible instance id as a
-    // second line of defense.
+    const robux = getRobuxFromPanel(panel);
+
+    // On the current React trade detail page the old collectible wrapper
+    // selectors can be absent even though our per-item blue values rendered
+    // correctly. Use the UI values we already resolved as the primary source.
+    const renderedValueNodes = Array.from(
+      panel.querySelectorAll(".tis-roli-value")
+    ).filter((node) => !node.closest(".tis-roli-offer-total"));
+
+    if (renderedValueNodes.length) {
+      const value = robux + renderedValueNodes.reduce(
+        (sum, node) => sum + parseNum(node.textContent || "0"),
+        0
+      );
+      const nativeRap = getNativeRapTotal(panel);
+      return { rap: nativeRap > 0 ? nativeRap : robux, value };
+    }
+
+    // Older Angular layouts still expose concrete offer-item elements.
     const tradeItems = Array.from(
       panel.querySelectorAll(".trade-request-item:not(.blank-item)")
     );
@@ -769,8 +797,8 @@
       ? tradeItems
       : Array.from(panel.querySelectorAll(".item-card-container[data-collectibleiteminstanceid]"));
 
-    let rap = getRobuxFromPanel(panel);
-    let value = rap;
+    let rap = robux;
+    let value = robux;
     const seenInstanceIds = new Set();
 
     items.forEach((item) => {
@@ -782,6 +810,8 @@
       value += getOfferValueFromItem(item);
     });
 
+    const nativeRap = getNativeRapTotal(panel);
+    if (nativeRap > 0) rap = nativeRap;
     return { rap, value };
   }
 
@@ -1708,69 +1738,49 @@
   function getTradeDeltaTarget() {
     const detailRoot = getActiveTradeDetailRoot();
     const detailOffers = Array.from(detailRoot?.querySelectorAll(".trade-list-detail-offer") || []);
-    const receiveOfferBlock = detailOffers[1] || null;
-    if (receiveOfferBlock?.parentElement) {
+    const giveOfferBlock = detailOffers[0] || null;
+    const giveValueLine = giveOfferBlock?.querySelector(".tis-roli-offer-total");
+    if (giveValueLine?.parentElement) {
       return {
-        anchor: receiveOfferBlock,
-        position: "beforebegin",
-        scope: receiveOfferBlock.parentElement,
+        anchor: giveValueLine,
+        position: "afterend",
+        scope: giveValueLine.parentElement,
         variant: "detail",
       };
     }
 
     const composerRoot = getActiveComposerRoot();
     const composerOffers = Array.from(composerRoot?.querySelectorAll(".trade-request-window-offer") || []);
-    const requestOfferBlock = composerOffers[1] || null;
-    if (requestOfferBlock?.parentElement) {
+    const giveComposerBlock = composerOffers[0] || null;
+    const giveComposerValueLine = giveComposerBlock?.querySelector(".tis-roli-offer-total");
+    if (giveComposerValueLine?.parentElement) {
       return {
-        anchor: requestOfferBlock,
-        position: "beforebegin",
-        scope: requestOfferBlock.parentElement,
-        variant: "composer",
-      };
-    }
-
-    // Compatibility fallback for older layouts where only the heading is easy
-    // to identify. Keep this after the structural second-offer target so the
-    // status does not fall through to the bottom action button on React pages.
-    const yourRequestHeader = Array.from(composerRoot?.querySelectorAll(".trade-request-window-offer > h2") || [])
-      .find((el) => (el.textContent || "").trim().toLowerCase() === "your request");
-    if (yourRequestHeader?.parentElement?.parentElement) {
-      return {
-        anchor: yourRequestHeader.parentElement,
-        position: "beforebegin",
-        scope: yourRequestHeader.parentElement.parentElement,
-        variant: "composer",
-      };
-    }
-
-    const composerButton = composerRoot?.querySelector(".trade-request-window-offers-parent .btn-cta-md.btn-full-width");
-    if (composerButton) {
-      return {
-        anchor: composerButton,
-        position: "beforebegin",
-        scope: composerButton.parentElement,
-        variant: "composer",
-      };
-    }
-
-    const tradeButtons = detailRoot?.querySelector(".trade-buttons");
-    if (tradeButtons) {
-      return {
-        anchor: tradeButtons.querySelector("button") || tradeButtons,
-        position: "beforebegin",
-        scope: tradeButtons.parentElement,
-        variant: "detail",
-      };
-    }
-
-    const detailOffersContainer = detailRoot?.querySelector(":scope > .col-xs-12");
-    if (detailOffersContainer) {
-      return {
-        anchor: detailOffersContainer,
+        anchor: giveComposerValueLine,
         position: "afterend",
-        scope: detailOffersContainer.parentElement,
+        scope: giveComposerValueLine.parentElement,
+        variant: "composer",
+      };
+    }
+
+    // Fallbacks for a momentary render where the injected total-value line
+    // has not appeared yet. Anchor to the first offer's native RAP total.
+    const giveNativeTotal = getNativeTotalLine(giveOfferBlock);
+    if (giveNativeTotal?.parentElement) {
+      return {
+        anchor: giveNativeTotal,
+        position: "afterend",
+        scope: giveNativeTotal.parentElement,
         variant: "detail",
+      };
+    }
+
+    const giveComposerNativeTotal = getNativeTotalLine(giveComposerBlock);
+    if (giveComposerNativeTotal?.parentElement) {
+      return {
+        anchor: giveComposerNativeTotal,
+        position: "afterend",
+        scope: giveComposerNativeTotal.parentElement,
+        variant: "composer",
       };
     }
 
