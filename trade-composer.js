@@ -1846,9 +1846,8 @@ window.tisAddToOfferVanilla = function tisAddToOfferVanilla(tradableItem, clicke
 
     const enqueueThumb = (thumb) => {
       if (!thumb || !thumb.isConnected) return;
-      const panel = thumb.closest?.(".trade-inventory-panel");
-      const panelState = getPanelState(panel);
-      if (panelState) syncThumbnailMemoryForThumb(thumb, panelState, null);
+      // Let the queued flush do the sync once. The old path did the same
+      // thumbnail work immediately and then repeated it in the microtask.
       queue.add(thumb);
       if (!microtaskQueued) {
         microtaskQueued = true;
@@ -4447,10 +4446,16 @@ window.addEventListener("message", (ev) => {
     scheduleInit("activate");
   });
 
-  // also run a few times early
+  // Retry while Roblox is still constructing the composer, but stop once our
+  // controls are actually wired. The previous loop reran the full setup forty
+  // times even after success.
   (async () => {
     for (let i = 0; i < 40; i++) {
       await initOnceReady();
+
+      const panels = getInventoryPanels();
+      if (panels.length && !pageNeedsComposerRepair()) break;
+
       await sleep(250);
     }
   })();
