@@ -2609,17 +2609,28 @@
     const cachedDetail = resolvedTradeId ? state.tradeDetailCache.get(resolvedTradeId) || null : null;
     const completedDate = formatDayMonthYear(getTradeCompletedDateInput(detailTrade, cachedDetail, selectedSummary, selectedContext?.trade));
 
-    let subtitle = detailRoot.querySelector(":scope > .tis-completed-trade-date");
+    // The heading can be nested inside detailRoot. Look throughout the active
+    // detail instead of only at direct children, or every render adds a new date.
+    const subtitles = Array.from(detailRoot.querySelectorAll(".tis-completed-trade-date"));
     if (!completedDate) {
-      subtitle?.remove();
+      subtitles.forEach((el) => el.remove());
       return;
     }
+
+    let subtitle = heading.nextElementSibling?.matches(".tis-completed-trade-date")
+      ? heading.nextElementSibling
+      : subtitles[0] || null;
 
     if (!subtitle) {
       subtitle = document.createElement("div");
       subtitle.className = "tis-completed-trade-date";
+    }
+    if (subtitle.previousElementSibling !== heading) {
       heading.insertAdjacentElement("afterend", subtitle);
     }
+    subtitles.forEach((el) => {
+      if (el !== subtitle) el.remove();
+    });
 
     setTextIfChanged(subtitle, `trade completed on ${completedDate}`);
   }
